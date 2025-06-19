@@ -1,6 +1,7 @@
+import os
 VERSION = "3.6 (Weighted Green Time)"
 MODEL_NAME = "yoloe-11m-seg.pt"
-AMBULANCE_MODEL_NAME = "C:\\Users\\harish\\Downloads\\last.pt"
+AMBULANCE_MODEL_NAME =  os.path.join(os.path.dirname(__file__), "last.pt")
 AMBULANCE_CLASS_NAMES = ["ambulance","ambulanceSiren"]
 TARGET_CLASSES = [
     'Bicycle',  'Motorcycle',
@@ -18,10 +19,10 @@ VEHICLE_TYPE_WEIGHTS = {
 }
 DEFAULT_VEHICLE_WEIGHT = 1.0
 VIDEO_PATHS = [
-    ("Northbound", "C:\\Users\\Harish\\Downloads\\vids\\vid1.mp4"),
-    ("Eastbound","C:\\Users\\Harish\\Downloads\\vids\\crowd.mp4"),
-    ("Westbound", "C:\\Users\\Harish\\Downloads\\vids\\amb2.mp4"),
-    ("Southbound", "C:\\Users\\Harish\\Downloads\\vids\\vid4.mp4"),
+    ("Northbound", os.path.join(os.path.dirname(__file__), "vid1.mp4")),
+    ("Eastbound",os.path.join(os.path.dirname(__file__), "vid1.mp4")),
+    ("Westbound", os.path.join(os.path.dirname(__file__), "vid1.mp4")),
+    ("Southbound", os.path.join(os.path.dirname(__file__), "vid1.mp4")),
 ]
 TRAFFIC_LIGHT_CONFIG = {
     "Intersection1": {
