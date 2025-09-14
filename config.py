@@ -71,3 +71,4 @@ ESP32_APPROACH_MAPPING = {
     "Westbound": "W",
     "Southbound": "S"
 }
+RL_MODEL_ENABLED = True

@@ -62,7 +62,7 @@ def main():
     num_lanes = 4
     num_vehicle_types = 2
     duration_options = [10, 20, 30]
-    input_size = num_lanes * num_vehicle_types
+    input_size = (num_lanes * num_vehicle_types) + num_lanes
     output_size = num_lanes * len(duration_options)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -95,11 +95,6 @@ def main():
     rl_waiting_times_float = [float(x) for x in rl_waiting_times]
     static_waiting_times_float = [float(x) for x in static_waiting_times]
 
-    # --- Calculate Statistics ---
-    # Convert numpy types to float for compatibility with statistics module
-    rl_waiting_times_float = [float(x) for x in rl_waiting_times]
-    static_waiting_times_float = [float(x) for x in static_waiting_times]
-
     rl_mean = statistics.mean(rl_waiting_times_float)
     rl_std = statistics.stdev(rl_waiting_times_float) if args.num_runs > 1 else 0
 
@@ -125,6 +120,7 @@ def main():
         print(f"Improvement of RL over Static: {improvement:.2f}%")
     else:
         print("Static agent had zero waiting time, cannot calculate improvement.")
+
 
 if __name__ == "__main__":
     main()

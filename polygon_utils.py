@@ -35,7 +35,7 @@ def define_polygon_interactive(approach_name, video_path):
     window_name = f"Define Polygon for {approach_name} ({video_filename})"
     _window_name_global = window_name 
 
-    cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(window_name)
     if not cap.isOpened():
         print(f"[Polygon] Error: Could not open video file: {video_path}")
         return None
