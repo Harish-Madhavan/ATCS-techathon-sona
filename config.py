@@ -42,7 +42,7 @@ TRAFFIC_LIGHT_CONFIG = {
             "ambulance_request_timeout": 8.0,
             "base_max_green": 20,
             "queued_weighted_demand_extension_factor": 0.5,
-            "absolute_max_green": 45,
+            "absolute_max_green": 60,
             "realtime_flow_extension_increment": 1.5,
             "realtime_flow_min_weighted_demand": 2.5,
         },
@@ -72,3 +72,9 @@ ESP32_APPROACH_MAPPING = {
     "Southbound": "S"
 }
 RL_MODEL_ENABLED = True
+RL_MODEL_PATH = "rl_model.pth"
+# Discrete green duration options the RL agent will be trained with.
+# Use a dense range for near-continuous control (5..60 seconds in 1s steps).
+DURATION_OPTIONS = list(range(5, 61))
+# Maximum allowed consecutive RL selections for the same lane before forcing variation
+MAX_CONSECUTIVE_RL_SAME_LANE = 2

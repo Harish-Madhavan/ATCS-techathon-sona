@@ -42,21 +42,16 @@ if __name__ == '__main__':
                  print(f"[Main] Could not set DPI awareness: {e2}")
 
     
+    manager = mp.Manager()
+    results_queue = manager.Queue()
     root = tk.Tk()
-    app = LaneCounterApp(root) 
+    app = LaneCounterApp(root, results_queue) 
 
     
     
     if app.initialize_application(): 
          print("[Main] Initialization complete. Starting main loop...")
          root.mainloop() 
-         print("[Main] Main loop exited.")
-    else:
-        print("[Main] Application initialization failed or was cancelled. Exiting.")
-        
-        try:
-            root.destroy()
-        except tk.TclError:
-            pass 
+         print("[Main] Main loop exited.") 
     cv2.destroyAllWindows()
     print("[Main] Script finished.")

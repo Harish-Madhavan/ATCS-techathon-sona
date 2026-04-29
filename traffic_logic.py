@@ -11,6 +11,9 @@ class TrafficLightController:
         self.all_approach_names = set()
         self.vehicle_type_weights = vehicle_type_weights if vehicle_type_weights is not None else {}
         self.default_vehicle_weight = default_vehicle_weight
+        # Deterministic ordering of vehicle types used for RL state construction
+        import config
+        self.vehicle_type_order = getattr(config, 'TARGET_CLASSES', list(self.vehicle_type_weights.keys()))
 
         if not config_data:
             print("[TrafficLogic Error] No configuration data provided.")
@@ -83,8 +86,10 @@ class TrafficLightController:
             "last_update_time": time.time(),
             "approach_demand": defaultdict(int),
             "approach_weighted_demand": defaultdict(float),
+            "approach_counts_by_type": defaultdict(lambda: {vt: 0 for vt in self.vehicle_type_order}),
             "last_detection_time_green": defaultdict(float),
             "last_weighted_flow_green": defaultdict(float),
+            "rl_enforced": False,
             "name": name,
             "managed_approaches": list(intersection_approaches),
             "demand_threshold": demand_threshold,
@@ -94,6 +99,10 @@ class TrafficLightController:
             "target_emergency_phase_key": None,
             "is_current_phase_emergency": False,
             "manual_override_red": defaultdict(bool), 
+            # Keep a deterministic RL phase order equal to the config's phase order
+            "rl_phase_order": phase_names_list,
+            "last_rl_chosen_lane": None,
+            "consecutive_rl_same_lane": 0,
         }
         print(f"[TrafficLogic]   - Initialized '{name}': Starting ALL_RED, first phase '{phase_names_list[0]}'. Managed approaches: {sorted(list(intersection_approaches))}")
 
@@ -140,6 +149,16 @@ class TrafficLightController:
         
         for int_state in self.intersections.values():
             if approach_name in int_state["managed_approaches"]:
+                # Store the latest per-vehicle-type counts in a deterministic order
+                if hasattr(int_state, 'get'):
+                    pass
+                try:
+                    # Ensure all known vehicle types present; unknown types ignored
+                    stored = {vt: int(counts_by_type.get(vt, 0)) for vt in self.vehicle_type_order}
+                    int_state['approach_counts_by_type'][approach_name] = stored
+                except Exception:
+                    # If vehicle_type_order is empty or something fails, skip storing counts
+                    pass
                 current_phase_key = int_state['phases'][int_state['current_phase_index']]
                 current_phase_approaches = int_state['config']['phases'].get(current_phase_key, [])
                 is_in_active_phase = (approach_name in current_phase_approaches)
@@ -214,6 +233,10 @@ class TrafficLightController:
         state['state_timer'] += delta_time
         if state['current_state'] == "GREEN":
             state['green_timer'] += delta_time
+            try:
+                print(f"[{state['name']}] DEBUG: green_timer={state['green_timer']:.1f} max_green={state.get('current_cycle_max_green',0):.1f} rl_enforced={state.get('rl_enforced',False)}")
+            except Exception:
+                pass
 
         self._update_ambulance_request_timeouts(state, current_time) 
 
@@ -245,25 +268,29 @@ class TrafficLightController:
                     next_state = "YELLOW"
                     switch_reason = f"Current green approach '{the_current_green_approach_on_entry}' MANUALLY FORCED TO RED."
                 
-                elif state['is_current_phase_emergency']: 
+                elif state['is_current_phase_emergency']:
                     if state['green_timer'] >= timings['emergency_green']:
                         next_state = "YELLOW"
                         switch_reason = f"Emergency Green ({timings['emergency_green']}s) for '{current_phase_key_on_entry}' ({the_current_green_approach_on_entry}) finished."
-                else: 
-                    if the_current_green_approach_on_entry and \
-                       state['last_weighted_flow_green'].get(the_current_green_approach_on_entry, 0.0) >= timings['realtime_flow_min_weighted_demand'] and \
-                       state['current_cycle_max_green'] < timings['absolute_max_green']:
-                        
-                        new_max_green = min(state['current_cycle_max_green'] + timings['realtime_flow_extension_increment'], timings['absolute_max_green'])
-                        if new_max_green > state['current_cycle_max_green']:
-                            print(f"[{state['name']}] Approach '{the_current_green_approach_on_entry}' real-time flow (W.Flow: {state['last_weighted_flow_green'].get(the_current_green_approach_on_entry, 0.0):.1f}) extending max green to {new_max_green:.1f}s.")
-                            state['current_cycle_max_green'] = new_max_green
-                        state['last_weighted_flow_green'][the_current_green_approach_on_entry] = 0.0 
+
+                # Non-emergency GREEN handling: allow dynamic extension and end when current_cycle_max_green reached
+                if not state['is_current_phase_emergency']:
+                    # Allow dynamic extension based on recent real-time flow if below absolute cap
+                    try:
+                        if state['current_cycle_max_green'] < timings['absolute_max_green'] and state['last_weighted_flow_green'].get(the_current_green_approach_on_entry, 0.0) >= timings['realtime_flow_min_weighted_demand']:
+                            new_max_green = min(state['current_cycle_max_green'] + timings['realtime_flow_extension_increment'], timings['absolute_max_green'])
+                            if new_max_green > state['current_cycle_max_green']:
+                                print(f"[{state['name']}] Extension: Approach '{the_current_green_approach_on_entry}' extending max green {state['current_cycle_max_green']:.1f}s -> {new_max_green:.1f}s due to realtime flow {state['last_weighted_flow_green'].get(the_current_green_approach_on_entry,0.0):.1f}")
+                                state['current_cycle_max_green'] = new_max_green
+                            state['last_weighted_flow_green'][the_current_green_approach_on_entry] = 0.0
+                    except Exception:
+                        pass
 
                     if state['green_timer'] >= state['current_cycle_max_green']:
                         next_state = "YELLOW"
                         switch_reason = f"Calculated Max Green ({state['current_cycle_max_green']:.1f}s) reached for {the_current_green_approach_on_entry}"
-                    elif state['green_timer'] >= timings['min_green']:
+                    # If RL enforced a specific duration, skip the 'min_green' gap-out checks
+                    elif state['green_timer'] >= timings['min_green'] and not state.get('rl_enforced', False):
                         max_conflicting_weighted_demand = 0.0
                         conflicting_approach_display_name = "N/A"
                         for other_phase_idx, other_p_key in enumerate(phase_keys_list):
@@ -332,90 +359,82 @@ class TrafficLightController:
                     
                     if not next_state: 
                         if rl_action is not None:
-                            # RL INTEGRATION
-                            num_duration_options = 3 # from training
-                            chosen_lane_index = rl_action // num_duration_options
-                            
-                            phase_keys_list_sorted = sorted(phase_keys_list)
-                            next_phase_key_selected = phase_keys_list_sorted[chosen_lane_index]
-                            state['current_phase_index'] = phase_keys_list.index(next_phase_key_selected)
-                            
-                            next_state = "GREEN"
-                            selected_approach_for_green_candidate = phases_config.get(next_phase_key_selected, ["Unknown"])[0]
-                            
-                            queued_w_demand = state['approach_weighted_demand'].get(selected_approach_for_green_candidate, 0.0)
-                            calculated_max_g = timings['base_max_green'] + (queued_w_demand * timings['queued_weighted_demand_extension_factor'])
-                            state['current_cycle_max_green'] = min(calculated_max_g, timings['absolute_max_green'])
-                            state['current_cycle_max_green'] = max(state['current_cycle_max_green'], timings['min_green'])
+                            # RL INTEGRATION: decode the action into lane and duration index
+                            try:
+                                import config as cfg
+                                duration_options = getattr(cfg, 'DURATION_OPTIONS', [10, 20, 30])
+                                num_duration_options = len(duration_options)
+                                if num_duration_options <= 0:
+                                    raise ValueError("No duration options configured for RL decoding.")
 
-                            switch_reason = switch_reason_prefix + f"RL CHOSE Phase '{next_phase_key_selected}' for approach '{selected_approach_for_green_candidate}'"
-                            state['is_current_phase_emergency'] = False
+                                chosen_lane_index = rl_action // num_duration_options
+                                chosen_duration_index = rl_action % num_duration_options
+
+                                # Use the deterministic RL phase order stored at intersection init
+                                phase_keys_list_ordered = state.get('rl_phase_order', phase_keys_list)
+                                if chosen_lane_index < 0 or chosen_lane_index >= len(phase_keys_list_ordered):
+                                    raise IndexError(f"Decoded lane index {chosen_lane_index} out of range (0..{len(phase_keys_list_ordered)-1}).")
+                                if chosen_duration_index < 0 or chosen_duration_index >= num_duration_options:
+                                    raise IndexError(f"Decoded duration index {chosen_duration_index} out of range (0..{num_duration_options-1}).")
+
+                                chosen_duration = duration_options[chosen_duration_index]
+                                next_phase_key_selected = phase_keys_list_ordered[chosen_lane_index]
+
+                                # Enforce maximum consecutive RL choice of the same lane
+                                try:
+                                    import config as cfg
+                                    max_repeat = getattr(cfg, 'MAX_CONSECUTIVE_RL_SAME_LANE', 2)
+                                except Exception:
+                                    max_repeat = 2
+
+                                last_rl_lane = state.get('last_rl_chosen_lane')
+                                chosen_lane_name = next_phase_key_selected
+                                # If last chosen lane (by RL) is the same and we've exceeded the cap, pick a different lane
+                                if last_rl_lane == chosen_lane_name and state.get('consecutive_rl_same_lane', 0) >= max_repeat:
+                                    # find next candidate in phase order that is not manually forced red
+                                    found_alternative = False
+                                    for offset in range(1, len(phase_keys_list_ordered)):
+                                        alt_idx = (chosen_lane_index + offset) % len(phase_keys_list_ordered)
+                                        alt_phase = phase_keys_list_ordered[alt_idx]
+                                        alt_approach = phases_config.get(alt_phase, [None])[0]
+                                        if alt_approach and not state['manual_override_red'].get(alt_approach, False):
+                                            next_phase_key_selected = alt_phase
+                                            chosen_lane_index = alt_idx
+                                            found_alternative = True
+                                            break
+                                    if not found_alternative:
+                                        # as a last resort, accept original selection (no alternative found)
+                                        pass
+
+                                state['current_phase_index'] = phase_keys_list.index(next_phase_key_selected)
+
+                                next_state = "GREEN"
+                                selected_approach_for_green_candidate = phases_config.get(next_phase_key_selected, ["Unknown"])[0]
+
+                                # Use the RL-chosen duration as the green length (clamped to allowed bounds)
+                                calc_g = float(chosen_duration)
+                                calc_g = min(calc_g, timings.get('absolute_max_green', calc_g))
+                                calc_g = max(calc_g, timings.get('min_green', calc_g))
+                                state['current_cycle_max_green'] = calc_g
+                                state['rl_enforced'] = True
+                                # update RL repetition tracking
+                                prev = state.get('last_rl_chosen_lane')
+                                if prev == next_phase_key_selected:
+                                    state['consecutive_rl_same_lane'] = state.get('consecutive_rl_same_lane', 0) + 1
+                                else:
+                                    state['consecutive_rl_same_lane'] = 1
+                                state['last_rl_chosen_lane'] = next_phase_key_selected
+                                print(f"[{state['name']}] RL set rl_enforced=True for '{selected_approach_for_green_candidate}'")
+                                print(f"[{state['name']}] RL set green for '{selected_approach_for_green_candidate}' to {state['current_cycle_max_green']:.1f}s (chosen_duration={chosen_duration})")
+
+                                switch_reason = switch_reason_prefix + f"RL CHOSE Phase '{next_phase_key_selected}' for approach '{selected_approach_for_green_candidate}' with duration {state['current_cycle_max_green']:.1f}s"
+                                state['is_current_phase_emergency'] = False
+                            except Exception as e_rl_decode:
+                                print(f"[{state['name']}] Error decoding RL action: {e_rl_decode}")
+                                rl_action = None
                         else:
-                            # ORIGINAL LOGIC
-                            skipped_phases_count = 0; next_phase_idx_candidate = state['current_phase_index']; original_starting_idx_for_search = state['current_phase_index']
-                            num_phases = len(phase_keys_list)
-                            selected_approach_for_green_candidate = None
-                            found_eligible_phase = False
-
-                            for _ in range(num_phases): 
-                                next_phase_idx_candidate = (next_phase_idx_candidate + 1) % num_phases
-                                next_p_key_to_check_candidate = phase_keys_list[next_phase_idx_candidate]
-                                approaches_to_check_candidate = phases_config.get(next_p_key_to_check_candidate, [])
-                                if not approaches_to_check_candidate: continue 
-                                
-                                the_single_approach_to_check_candidate = approaches_to_check_candidate[0]
-                                
-                                
-                                if state["manual_override_red"].get(the_single_approach_to_check_candidate, False):
-                                    print(f"[{state['name']}] Phase '{next_p_key_to_check_candidate}' for approach '{the_single_approach_to_check_candidate}' is MANUALLY FORCED RED. Skipping.")
-                                    skipped_phases_count += 1
-                                    
-                                    state['approach_demand'][the_single_approach_to_check_candidate] = 0 
-                                    state['approach_weighted_demand'][the_single_approach_to_check_candidate] = 0.0
-                                    continue 
-
-                                
-                                if state['ambulance_request_active'].get(the_single_approach_to_check_candidate, False):
-                                    print(f"[{state['name']}] Approach '{the_single_approach_to_check_candidate}' (Phase '{next_p_key_to_check_candidate}') has ambulance and is NOT overridden. Selecting.")
-                                    selected_approach_for_green_candidate = the_single_approach_to_check_candidate
-                                    found_eligible_phase = True
-                                    break 
-                                
-                                
-                                weighted_demand_for_next_approach_candidate = state['approach_weighted_demand'].get(the_single_approach_to_check_candidate, 0.0)
-                                if weighted_demand_for_next_approach_candidate <= timings['skip_threshold']:
-                                    print(f"[{state['name']}] Skipping phase '{next_p_key_to_check_candidate}' for approach '{the_single_approach_to_check_candidate}' (W.Demand: {weighted_demand_for_next_approach_candidate:.1f} <= {timings['skip_threshold']})")
-                                    skipped_phases_count += 1
-                                    state['approach_demand'][the_single_approach_to_check_candidate] = 0 
-                                    state['approach_weighted_demand'][the_single_approach_to_check_candidate] = 0.0
-                                else: 
-                                    selected_approach_for_green_candidate = the_single_approach_to_check_candidate
-                                    found_eligible_phase = True
-                                    break 
-                            
-                            if not found_eligible_phase:
-                                
-                                
-                                
-                                print(f"[{state['name']}] Warning: All non-overridden phases met skip criteria or no eligible phase. Advancing to phase after original or staying ALL_RED if all overridden.")
-                                
-                                
-                                
-                                next_phase_idx_candidate = (original_starting_idx_for_search + 1) % num_phases
-                                selected_approach_for_green_candidate = phases_config.get(phase_keys_list[next_phase_idx_candidate], ["Unknown"])[0]
-                                
-
-                            state['current_phase_index'] = next_phase_idx_candidate 
-                            next_state = "GREEN"
-                            next_phase_key_selected = phase_keys_list[state['current_phase_index']]
-                            
-                            queued_w_demand = state['approach_weighted_demand'].get(selected_approach_for_green_candidate, 0.0) if selected_approach_for_green_candidate else 0.0
-                            calculated_max_g = timings['base_max_green'] + (queued_w_demand * timings['queued_weighted_demand_extension_factor'])
-                            state['current_cycle_max_green'] = min(calculated_max_g, timings['absolute_max_green'])
-                            state['current_cycle_max_green'] = max(state['current_cycle_max_green'], timings['min_green'])
-
-                            switch_reason = switch_reason_prefix + f"Starting Phase '{next_phase_key_selected}' for approach '{selected_approach_for_green_candidate}' (Est. Max Green: {state['current_cycle_max_green']:.1f}s)"
-                            state['is_current_phase_emergency'] = False 
+                            # Non-RL path has been removed: require RL to select the next phase.
+                            print(f"[{state['name']}] No RL action provided; remaining in ALL_RED until RL selects a phase.")
 
                         if state['emergency_preemption_active'] and phase_keys_list[state['current_phase_index']] != state['target_emergency_phase_key']:
                              print(f"[{state['name']}] Emergency preemption for '{state['target_emergency_phase_key']}' concluded as normal phase '{phase_keys_list[state['current_phase_index']]}' starts.")
@@ -462,6 +481,9 @@ class TrafficLightController:
                 new_green_approach = phases_config.get(new_green_approach_key, ["Unknown"])[0]
                 if new_green_approach != "Unknown":
                     state['last_weighted_flow_green'][new_green_approach] = 0.0
+            else:
+                # clear any RL enforcement when leaving GREEN
+                state['rl_enforced'] = False
         
         state['last_update_time'] = current_time
         return state_did_change
@@ -470,25 +492,51 @@ class TrafficLightController:
         state_data = self.intersections.get(intersection_name)
         if not state_data:
             return None
+        # Use deterministic phase order assigned at initialization
+        phase_order = state_data.get('rl_phase_order', state_data['phases'])
+        num_lanes = len(phase_order)
 
-        num_lanes = len(state_data['phases'])
-        phase_keys = sorted(state_data['phases'])
-
-        approach_demands = []
-        for phase_key in phase_keys:
+        # Build vehicle counts per lane in the configured vehicle type order
+        vt_order = self.vehicle_type_order if self.vehicle_type_order else []
+        counts_list = []
+        for phase_key in phase_order:
             approach_name = state_data['config']['phases'][phase_key][0]
-            demand = state_data['approach_weighted_demand'].get(approach_name, 0.0)
-            approach_demands.append([demand, 0]) # Assuming demand is for the first vehicle type
+            stored_counts = state_data['approach_counts_by_type'].get(approach_name, {})
+            # If no vehicle types configured, fall back to weighted demand as single scalar
+            if not vt_order:
+                demand = state_data['approach_weighted_demand'].get(approach_name, 0.0)
+                counts_list.append([demand])
+            else:
+                per_type = [float(stored_counts.get(vt, 0)) for vt in vt_order]
+                counts_list.append(per_type)
 
-        vehicle_counts = np.array(approach_demands)
+        vehicle_counts = np.array(counts_list, dtype=float)
 
+        # Add wait times (normalized by time since last green or current wait metrics)
+        wait_times = []
+        for phase_key in phase_order:
+            approach_name = state_data['config']['phases'][phase_key][0]
+            # Use approach_wait_time if available, else 0
+            w = float(state_data['approach_wait_time'].get(approach_name, 0.0))
+            wait_times.append(w)
+        wait_times = np.array(wait_times, dtype=float)
+
+        # Add ambulance flags
+        ambulance_flags = []
+        for phase_key in phase_order:
+            approach_name = state_data['config']['phases'][phase_key][0]
+            is_amb = 1.0 if state_data['ambulance_request_active'].get(approach_name, False) else 0.0
+            ambulance_flags.append(is_amb)
+        ambulance_flags = np.array(ambulance_flags, dtype=float)
+
+        # one-hot of the current phase in the same phase order
         one_hot_lane = np.zeros(num_lanes)
         current_phase_key = state_data['phases'][state_data['current_phase_index']]
-        if current_phase_key in phase_keys:
-            current_phase_idx_sorted = phase_keys.index(current_phase_key)
-            one_hot_lane[current_phase_idx_sorted] = 1
+        if current_phase_key in phase_order:
+            current_idx = phase_order.index(current_phase_key)
+            one_hot_lane[current_idx] = 1
 
-        return np.concatenate([vehicle_counts.flatten(), one_hot_lane])
+        return np.concatenate([vehicle_counts.flatten(), wait_times, ambulance_flags, one_hot_lane])
 
     def get_intersection_names(self):
         return list(self.intersections.keys())
