@@ -74,7 +74,7 @@ ESP32_APPROACH_MAPPING = {
 RL_MODEL_ENABLED = True
 RL_MODEL_PATH = "rl_model.pth"
 # Discrete green duration options the RL agent will be trained with.
-# Use a dense range for near-continuous control (5..60 seconds in 1s steps).
-DURATION_OPTIONS = list(range(5, 61))
+# A curated set balances granularity with action-space tractability (4 lanes × 12 = 48 actions).
+DURATION_OPTIONS = [5, 8, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60]
 # Maximum allowed consecutive RL selections for the same lane before forcing variation
 MAX_CONSECUTIVE_RL_SAME_LANE = 2

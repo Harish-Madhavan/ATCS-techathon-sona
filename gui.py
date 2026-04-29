@@ -644,7 +644,7 @@ class LaneCounterApp:
                         
                         num_lanes = len(config.TRAFFIC_LIGHT_CONFIG['Intersection1']['phases'])
                         num_vehicle_types = len(config.TARGET_CLASSES)
-                        v_end = num_lanes * num_vehicle_types
+                        v_end = num_lanes * (num_vehicle_types if num_vehicle_types > 0 else 1)
                         w_end = v_end + num_lanes
                         
                         state_arr = np.array(rl_state, dtype=float)

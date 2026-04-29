@@ -6,13 +6,19 @@ import config
 
 from train import TrafficEnv, DuelingQNetwork
 
-def run_simulation(env, agent, num_steps=1000):
-    
+def run_simulation(env, agent, max_time=1800.0):
+    """
+    Run one episode of simulation until done (simulated time exhausted).
+    Returns the negative total reward (higher = worse).
+    """
     state = env.reset()
+    state = env.normalize_state(state, agent.normalize_max)
     total_reward = 0
-    for _ in range(num_steps):
-        action = agent.choose_action(state)
+    done = False
+    while not done:
+        action = agent.choose_action(state, env)
         next_state, reward, done, _ = env.step(action)
+        next_state = env.normalize_state(next_state, agent.normalize_max)
         total_reward += reward
         state = next_state
 
@@ -45,21 +51,21 @@ class RLAgent:
         self.device = device
         self.normalize_max = max(1.0, float(normalize_max))
 
-    def choose_action(self, state):
-        # Normalize state the same way as during training
-        state_arr = np.array(state, dtype=float) / self.normalize_max
-        state_tensor = torch.FloatTensor(state_arr).unsqueeze(0).to(self.device)
+    def choose_action(self, state, env=None):
+        # State should already be normalized by the caller
+        state_tensor = torch.FloatTensor(np.array(state, dtype=float)).unsqueeze(0).to(self.device)
         with torch.no_grad():
             q_values = self.model(state_tensor)
         return int(torch.argmax(q_values).item())
 
 class StaticAgent:
     """Agent that cycles through lanes with a fixed green light duration."""
-    def __init__(self, num_lanes, duration_options, fixed_duration=30):
+    def __init__(self, num_lanes, duration_options, fixed_duration=30, normalize_max=50.0):
         self.num_lanes = num_lanes
         self.duration_options = duration_options
         self.num_duration_options = len(duration_options)
         self.fixed_duration = fixed_duration
+        self.normalize_max = max(1.0, float(normalize_max))
         try:
             # Find the index of the desired fixed duration.
             self.duration_index = self.duration_options.index(self.fixed_duration)
@@ -68,7 +74,7 @@ class StaticAgent:
             self.duration_index = min(range(len(self.duration_options)), key=lambda i: abs(self.duration_options[i] - self.fixed_duration))
         self.current_lane = 0
 
-    def choose_action(self, state):
+    def choose_action(self, state, env=None):
         action = self.current_lane * self.num_duration_options + self.duration_index
         self.current_lane = (self.current_lane + 1) % self.num_lanes
         return action
@@ -93,14 +99,16 @@ def main():
         vehicle_type_names = [v.strip() for v in args.vehicle_types.split(',') if v.strip()]
     else:
         try:
-            vehicle_type_names = list(config.VEHICLE_TYPE_WEIGHTS.keys())[:2]
+            vehicle_type_names = list(config.VEHICLE_TYPE_WEIGHTS.keys())
             if not vehicle_type_names:
                 vehicle_type_names = ['car', 'truck']
         except Exception:
             vehicle_type_names = ['car', 'truck']
 
     duration_options = getattr(config, 'DURATION_OPTIONS', [10, 20, 30])
-    input_size = (num_lanes * len(vehicle_type_names)) + num_lanes
+    num_vehicle_types = len(vehicle_type_names)
+    v_end = num_lanes * (num_vehicle_types if num_vehicle_types > 0 else 1)
+    input_size = v_end + num_lanes + num_lanes + num_lanes
     output_size = num_lanes * len(duration_options)
 
     # Decide device early so we can inspect checkpoints with correct map_location
@@ -150,19 +158,19 @@ def main():
     static_agent = StaticAgent(num_lanes, duration_options, fixed_duration=30)
 
     # --- Run Benchmark Simulations ---
-    print(f"\nRunning {args.num_runs} simulations of {args.num_steps} steps each...")
+    print(f"\nRunning {args.num_runs} episodes each (simulated time = {env.max_time}s per episode)...")
     
     rl_waiting_times = []
     for i in range(args.num_runs):
         print(f"  RL Agent Run {i+1}/{args.num_runs}...", end='\r')
-        waiting_time = run_simulation(env, rl_agent, args.num_steps)
+        waiting_time = run_simulation(env, rl_agent)
         rl_waiting_times.append(waiting_time)
     print("\nRL agent simulations complete.")
 
     static_waiting_times = []
     for i in range(args.num_runs):
         print(f"  Static Agent Run {i+1}/{args.num_runs}...", end='\r')
-        waiting_time = run_simulation(env, static_agent, args.num_steps)
+        waiting_time = run_simulation(env, static_agent)
         static_waiting_times.append(waiting_time)
     print("\nStatic agent simulations complete.")
 
@@ -180,7 +188,7 @@ def main():
     # --- Display Results ---
     print("\n--- Benchmark Results ---")
     print(f"Number of simulation runs: {args.num_runs}")
-    print(f"Steps per simulation: {args.num_steps}")
+    print(f"Simulated time per episode: {env.max_time}s")
     print("-" * 30)
     print("RL Agent:")
     print(f"  Mean Total Waiting Time: {rl_mean:.2f}")

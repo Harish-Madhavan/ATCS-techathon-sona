@@ -86,6 +86,7 @@ class TrafficLightController:
             "last_update_time": time.time(),
             "approach_demand": defaultdict(int),
             "approach_weighted_demand": defaultdict(float),
+            "approach_wait_time": defaultdict(float),
             "approach_counts_by_type": defaultdict(lambda: {vt: 0 for vt in self.vehicle_type_order}),
             "last_detection_time_green": defaultdict(float),
             "last_weighted_flow_green": defaultdict(float),
@@ -258,6 +259,13 @@ class TrafficLightController:
         current_phase_key_on_entry = phase_keys_list[state['current_phase_index']]
         current_phase_actual_approaches_on_entry = phases_config.get(current_phase_key_on_entry, [])
         the_current_green_approach_on_entry = current_phase_actual_approaches_on_entry[0] if current_phase_actual_approaches_on_entry else None
+
+        # Update wait times for all approaches
+        for approach in state['managed_approaches']:
+            if state['current_state'] == "GREEN" and approach == the_current_green_approach_on_entry:
+                state['approach_wait_time'][approach] = 0.0
+            else:
+                state['approach_wait_time'][approach] += delta_time
 
 
         if next_state is None: 
@@ -434,7 +442,14 @@ class TrafficLightController:
                                 rl_action = None
                         else:
                             # Non-RL path has been removed: require RL to select the next phase.
-                            print(f"[{state['name']}] No RL action provided; remaining in ALL_RED until RL selects a phase.")
+                            print(f"[{state['name']}] No RL action provided; falling back to round-robin.")
+                            next_phase_idx = (state['current_phase_index'] + 1) % len(phase_keys_list)
+                            state['current_phase_index'] = next_phase_idx
+                            next_state = "GREEN"
+                            selected_approach = phases_config.get(phase_keys_list[next_phase_idx], ["Unknown"])[0]
+                            state['current_cycle_max_green'] = timings.get('base_max_green', 20)
+                            switch_reason = switch_reason_prefix + f"Fallback round-robin selected Phase '{phase_keys_list[next_phase_idx]}' for approach '{selected_approach}'"
+                            state['is_current_phase_emergency'] = False
 
                         if state['emergency_preemption_active'] and phase_keys_list[state['current_phase_index']] != state['target_emergency_phase_key']:
                              print(f"[{state['name']}] Emergency preemption for '{state['target_emergency_phase_key']}' concluded as normal phase '{phase_keys_list[state['current_phase_index']]}' starts.")

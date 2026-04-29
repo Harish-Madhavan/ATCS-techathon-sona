@@ -13,15 +13,16 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import config
 
-def get_time_varying_arrival_rate(step, total_steps, base_rate=0.1, peak_multiplier=4.0):
+def get_time_varying_arrival_rate(time_fraction, base_rate=0.1, peak_multiplier=4.0):
     """
     Simulates a rush hour pattern using a sinusoidal wave.
+    time_fraction should be in [0, 1] representing progress through the episode.
     Starts at base_rate, peaks in the middle, and returns to base_rate.
     """
-    # Scale step to be in the range [0, 2*pi]
-    radian_step = (step / total_steps) * 2 * np.pi
+    # Scale fraction to be in the range [0, 2*pi]
+    radian = time_fraction * 2 * np.pi
     # Use a sine wave shifted and scaled to create a single peak
-    multiplier = 1 + (peak_multiplier - 1) * (-np.cos(radian_step) + 1) / 2
+    multiplier = 1 + (peak_multiplier - 1) * (-np.cos(radian) + 1) / 2
     return base_rate * multiplier
 
 class TrafficEnv:
@@ -48,6 +49,8 @@ class TrafficEnv:
         self.action_space_size = self.num_lanes * self.num_duration_options
         self.use_time_varying_arrival_rate = use_time_varying_arrival_rate
         self.total_steps = total_steps
+        self.max_time = 1800.0 # 30 mins of simulated time per episode
+        self.current_time = 0.0
         self.current_step = 0
 
         # arrival_rate_per_lane: list of lambda (vehicles/sec) for Poisson arrivals; if a single float provided, broadcast
@@ -76,7 +79,7 @@ class TrafficEnv:
 
     def normalize_state(self, state, normalize_max):
         # state is [vehicle_counts (24), wait_times (4), ambulance_flags (4), one_hot_lane (4)]
-        v_end = self.num_lanes * self.num_vehicle_types
+        v_end = self.num_lanes * (self.num_vehicle_types if self.num_vehicle_types > 0 else 1)
         w_end = v_end + self.num_lanes
         normalized = state.copy()
         normalized[:v_end] = normalized[:v_end] / max(1.0, float(normalize_max))
@@ -92,6 +95,7 @@ class TrafficEnv:
         self.wait_times = np.zeros(self.num_lanes, dtype=float)
         self.current_lane = 0
         self.current_step = 0
+        self.current_time = 0.0
         return self._get_state()
 
     def _get_state(self):
@@ -105,7 +109,8 @@ class TrafficEnv:
     def step(self, action):
         self.current_step += 1
         if self.use_time_varying_arrival_rate:
-            current_arrival_rate = get_time_varying_arrival_rate(self.current_step, self.total_steps, base_rate=self.base_arrival_rate)
+            time_fraction = min(self.current_time / max(1.0, self.max_time), 1.0)
+            current_arrival_rate = get_time_varying_arrival_rate(time_fraction, base_rate=self.base_arrival_rate)
             self.arrival_rate_per_lane = [current_arrival_rate] * self.num_lanes
 
         lane = int(action // self.num_duration_options)
@@ -169,18 +174,30 @@ class TrafficEnv:
         self.state_vehicle_counts = np.minimum(self.state_vehicle_counts, self.max_queue)
 
         # Reward: penalize queues, wait times, and ESPECIALLY waiting ambulances
-        queue_penalty = -float(np.sum(self.state_vehicle_counts * self.vehicle_weights))
-        wait_penalty = -2.0 * float(np.sum(self.wait_times))
-        amb_penalty = -1000.0 * np.sum(self.ambulance_presence) 
-        reward = queue_penalty + wait_penalty + amb_penalty
+        # Normalize each component to roughly [-1, 0] range for stability
+        max_queue_penalty = self.num_lanes * self.max_queue * float(np.max(self.vehicle_weights))
+        queue_penalty = -float(np.sum(self.state_vehicle_counts * self.vehicle_weights)) / max(1.0, max_queue_penalty)
+        
+        max_wait = self.max_time  # theoretical max wait
+        wait_penalty = -float(np.sum(self.wait_times)) / max(1.0, max_wait)
+        
+        amb_penalty = -10.0 * float(np.sum(self.ambulance_presence))  # strong but bounded
+        
+        # Integrate penalty over the duration to avoid the agent picking short durations
+        # Normalize duration by max possible duration so the multiplier is in [0, 1]
+        max_dur = float(max(self.duration_options)) if self.duration_options else 60.0
+        duration_weight = duration / max_dur
+        
+        reward = (queue_penalty + wait_penalty + amb_penalty) * duration_weight
 
-        done = False
+        self.current_time += duration
+        done = self.current_time >= self.max_time
         next_state = self._get_state()
         return next_state, reward, done, {}
 
 
 class DuelingQNetwork(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size=128):
+    def __init__(self, input_size, output_size, hidden_size=256):
         super(DuelingQNetwork, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
@@ -208,7 +225,7 @@ def train(
     normalize_max=50.0,
     num_episodes=5000,
     batch_size=128,
-    replay_buffer_size=20000,
+    replay_buffer_size=50000,
     learning_rate=1e-3,
     gamma=0.95,
     epsilon_start=1.0,
@@ -222,14 +239,16 @@ def train(
 ):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 
-    duration_options = duration_options
+    duration_options = duration_options if duration_options is not None else [10, 20, 30]
     vehicle_type_names = vehicle_type_names or ['car', 'truck']
     vehicle_weights = vehicle_weights or [1.0, 2.0]
 
-    input_size = (num_lanes * len(vehicle_type_names)) + num_lanes + num_lanes + num_lanes
+    num_vehicle_types = len(vehicle_type_names)
+    v_end = num_lanes * (num_vehicle_types if num_vehicle_types > 0 else 1)
+    input_size = v_end + num_lanes + num_lanes + num_lanes
     output_size = num_lanes * len(duration_options)
 
-    if(torch.xpu.is_available()):
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
         device= "xpu"
     elif(torch.cuda.is_available()):
         device = "cuda"
@@ -263,8 +282,9 @@ def train(
         state = env.normalize_state(state, normalize_max)
         episode_reward = 0.0
         last_lane_chosen = None
+        done = False
 
-        for step in range(50):
+        while not done:
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
             if random.random() < epsilon:
                 action = random.randint(0, output_size - 1)
@@ -307,6 +327,7 @@ def train(
                 loss = criterion(current_q_values, target_q_values)
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 optimizer.step()
 
         if epsilon > epsilon_end:
@@ -334,11 +355,15 @@ if __name__ == '__main__':
     vehicle_weights = [config.VEHICLE_TYPE_WEIGHTS[vt] for vt in vehicle_type_names]
     duration_options = config.DURATION_OPTIONS
 
+    print(f"[Train] Lanes: {num_lanes}, Vehicle types: {vehicle_type_names}")
+    print(f"[Train] Duration options: {len(duration_options)} values, range [{min(duration_options)}-{max(duration_options)}]")
+    print(f"[Train] Action space: {num_lanes * len(duration_options)} actions")
+
     train(
         num_lanes=num_lanes,
         vehicle_type_names=vehicle_type_names,
         vehicle_weights=vehicle_weights,
         duration_options=duration_options,
-        num_episodes=2000,
+        num_episodes=3000,
         use_time_varying_arrival_rate=True
     )
