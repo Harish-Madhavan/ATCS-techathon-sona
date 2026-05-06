@@ -53,10 +53,9 @@ class TrafficEnv:
         self.current_time = 0.0
         self.current_step = 0
 
-        # arrival_rate_per_lane: list of lambda (vehicles/sec) for Poisson arrivals; if a single float provided, broadcast
         if arrival_rate_per_lane is None:
             self.base_arrival_rate = 0.2
-            arrival_rate_per_lane = [self.base_arrival_rate] * self.num_lanes
+            arrival_rate_per_lane = [0.1, 0.4, 0.1, 0.4]
         else:
             self.base_arrival_rate = arrival_rate_per_lane if isinstance(arrival_rate_per_lane, (int, float)) else np.mean(arrival_rate_per_lane)
 
@@ -173,22 +172,12 @@ class TrafficEnv:
         # clamp queues
         self.state_vehicle_counts = np.minimum(self.state_vehicle_counts, self.max_queue)
 
-        # Reward: penalize queues, wait times, and ESPECIALLY waiting ambulances
-        # Normalize each component to roughly [-1, 0] range for stability
-        max_queue_penalty = self.num_lanes * self.max_queue * float(np.max(self.vehicle_weights))
-        queue_penalty = -float(np.sum(self.state_vehicle_counts * self.vehicle_weights)) / max(1.0, max_queue_penalty)
+        # Reward: Give positive reward for clearing vehicles, subtract small penalty for queues.
+        # This makes the agent greedy and avoids duration bias.
+        cleared_value = float(np.sum(vehicles_passed * self.vehicle_weights))
+        current_queue_weight = float(np.sum(self.state_vehicle_counts * self.vehicle_weights))
         
-        max_wait = self.max_time  # theoretical max wait
-        wait_penalty = -float(np.sum(self.wait_times)) / max(1.0, max_wait)
-        
-        amb_penalty = -10.0 * float(np.sum(self.ambulance_presence))  # strong but bounded
-        
-        # Integrate penalty over the duration to avoid the agent picking short durations
-        # Normalize duration by max possible duration so the multiplier is in [0, 1]
-        max_dur = float(max(self.duration_options)) if self.duration_options else 60.0
-        duration_weight = duration / max_dur
-        
-        reward = (queue_penalty + wait_penalty + amb_penalty) * duration_weight
+        reward = cleared_value - current_queue_weight * 0.1
 
         self.current_time += duration
         done = self.current_time >= self.max_time
@@ -201,6 +190,7 @@ class DuelingQNetwork(nn.Module):
         super(DuelingQNetwork, self).__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, hidden_size)
 
         # Value and Advantage heads
         self.value_head = nn.Linear(hidden_size, 1)
@@ -209,6 +199,7 @@ class DuelingQNetwork(nn.Module):
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
+        x = torch.relu(self.fc3(x))
         v = self.value_head(x)
         a = self.adv_head(x)
         # combine: Q = V + (A - mean(A))
@@ -227,10 +218,10 @@ def train(
     batch_size=128,
     replay_buffer_size=50000,
     learning_rate=1e-3,
-    gamma=0.95,
+    gamma=0.90,
     epsilon_start=1.0,
     epsilon_end=0.01,
-    epsilon_decay=0.997,
+    epsilon_decay=0.98,
     target_update_frequency=10,
     checkpoint_interval=500,
     device_str=None,
@@ -248,12 +239,7 @@ def train(
     input_size = v_end + num_lanes + num_lanes + num_lanes
     output_size = num_lanes * len(duration_options)
 
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        device= "xpu"
-    elif(torch.cuda.is_available()):
-        device = "cuda"
-    else:
-        device = "cpu"
+    device = "cpu"
     print(f"Training on device: {device}" )
 
     env = TrafficEnv(num_lanes=num_lanes,
@@ -294,17 +280,17 @@ def train(
                 action = int(torch.argmax(q_values).item())
 
             next_state, reward, done, _ = env.step(action)
-            # apply a small penalty for choosing the same lane repeatedly to encourage fairness
+            
             chosen_lane = int(action // env.num_duration_options)
             if last_lane_chosen is not None and chosen_lane == last_lane_chosen:
-                repeat_penalty = -0.5  # tunable penalty per repeated selection
-                reward += repeat_penalty
+                reward += -0.5
             last_lane_chosen = chosen_lane
-            next_state = env.normalize_state(next_state, normalize_max)
+            
+            next_state_normalized = env.normalize_state(next_state, normalize_max)
             episode_reward += reward
 
-            replay_buffer.append((state, action, reward, next_state, done))
-            state = next_state
+            replay_buffer.append((state, action, reward, next_state_normalized, done))
+            state = next_state_normalized
 
             if len(replay_buffer) >= batch_size:
                 batch = random.sample(replay_buffer, batch_size)
@@ -336,16 +322,16 @@ def train(
         if episode % target_update_frequency == 0:
             target_model.load_state_dict(model.state_dict())
 
-        if episode % checkpoint_interval == 0:
+        if episode % 50 == 0:
             torch.save(model.state_dict(), f"rl_model_ep{episode}.pth")
-            print(f"Checkpoint saved: rl_model_ep{episode}.pth (episode {episode})")
+            print(f"Checkpoint saved: rl_model_ep{episode}.pth (episode {episode})", flush=True)
 
-        if episode % 100 == 0:
+        if episode % 10 == 0:
             elapsed = time.time() - start_time
-            print(f"Episode {episode}/{num_episodes}, Episode Reward: {episode_reward:.2f}, Epsilon: {epsilon:.4f}, Elapsed: {elapsed:.1f}s")
+            print(f"Episode {episode}/{num_episodes}, Episode Reward: {episode_reward:.2f}, Epsilon: {epsilon:.4f}, Elapsed: {elapsed:.1f}s", flush=True)
 
     torch.save(model.state_dict(), "rl_model.pth")
-    print("Training complete. Model saved as rl_model.pth")
+    print("Training complete. Model saved as rl_model.pth", flush=True)
 
 
 if __name__ == '__main__':
@@ -364,6 +350,6 @@ if __name__ == '__main__':
         vehicle_type_names=vehicle_type_names,
         vehicle_weights=vehicle_weights,
         duration_options=duration_options,
-        num_episodes=3000,
+        num_episodes=100,
         use_time_varying_arrival_rate=True
     )

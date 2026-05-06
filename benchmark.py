@@ -6,23 +6,77 @@ import config
 
 from train import TrafficEnv, DuelingQNetwork
 
-def run_simulation(env, agent, max_time=1800.0):
+def run_simulation(env, agent):
     """
     Run one episode of simulation until done (simulated time exhausted).
-    Returns the negative total reward (higher = worse).
+    Returns a dictionary of metrics.
     """
     state = env.reset()
     state = env.normalize_state(state, agent.normalize_max)
     total_reward = 0
     done = False
+    
+    # Metrics tracking
+    queue_lengths = []
+    max_wait_times = []
+    emergency_delays = []
+    
+    # Track when ambulances arrive
+    ambulance_arrival_times = {} # lane_idx -> [arrival_time, ...]
+    
+    total_cleared = 0
+    
     while not done:
+        # Before step, record arrivals
+        for ln in range(env.num_lanes):
+            if env.ambulance_presence[ln] > 0:
+                if ln not in ambulance_arrival_times:
+                    ambulance_arrival_times[ln] = env.current_time
+
         action = agent.choose_action(state, env)
+        
+        # Step the environment
+        # We need to know how many vehicles passed. 
+        # Since env.step doesn't return it, let's look at how it calculates it.
+        # vehicles_passed = min(available, can_pass) ...
+        # Let's modify env.step to return this, or just calculate it here.
+        # Actually, let's just use the reward cleared_value as a proxy if we can.
+        # Or better, just sum up the weight of vehicles cleared.
+        
+        # To get the actual count, I'd have to modify train.py.
+        # Let's check if I can modify train.py safely.
+        
         next_state, reward, done, _ = env.step(action)
+        
+        # We can estimate vehicles cleared from reward if we know the penalty.
+        # Reward = cleared_value - current_queue_weight * 0.1
+        # cleared_value = reward + current_queue_weight * 0.1
+        current_queue_weight = float(np.sum(env.state_vehicle_counts * env.vehicle_weights))
+        cleared_value = reward + current_queue_weight * 0.1
+        total_cleared += cleared_value
+
         next_state = env.normalize_state(next_state, agent.normalize_max)
+        
+        post_counts = env.state_vehicle_counts.copy()
+        queue_lengths.append(np.sum(post_counts))
+        max_wait_times.append(np.max(env.wait_times))
+        
         total_reward += reward
         state = next_state
+        
+        for ln in range(env.num_lanes):
+            if ln in ambulance_arrival_times and env.ambulance_presence[ln] == 0:
+                delay = env.current_time - ambulance_arrival_times[ln]
+                emergency_delays.append(delay)
+                del ambulance_arrival_times[ln]
 
-    return -total_reward
+    return {
+        "total_reward": total_reward,
+        "avg_queue_len": np.mean(queue_lengths),
+        "max_wait_time": np.max(max_wait_times),
+        "emergency_delay": np.mean(emergency_delays) if emergency_delays else 0,
+        "throughput": total_cleared
+    }
 
 class RLAgent:
     """Agent that uses a trained Q-network to make decisions."""
@@ -32,17 +86,15 @@ class RLAgent:
         
         inferred_output = None
         if isinstance(ckpt, dict):
-            
             for k in ('adv_head.weight', 'adv_head.bias', 'value_head.weight', 'value_head.bias'):
                 if k in ckpt:
                     param = ckpt[k]
                     if hasattr(param, 'shape'):
-                       
                         if len(param.shape) >= 1:
                             inferred_output = int(param.shape[0])
                             break
         if inferred_output is not None and inferred_output != output_size:
-            raise RuntimeError(f"Model at '{model_path}' has output size {inferred_output} but benchmark expected {output_size}. Use --use_model_action_space to auto-adjust the environment action space to the model.")
+            raise RuntimeError(f"Model mismatch. Use --use_model_action_space.")
 
         self.model = DuelingQNetwork(input_size, output_size)
         self.model.load_state_dict(ckpt)
@@ -52,7 +104,6 @@ class RLAgent:
         self.normalize_max = max(1.0, float(normalize_max))
 
     def choose_action(self, state, env=None):
-        # State should already be normalized by the caller
         state_tensor = torch.FloatTensor(np.array(state, dtype=float)).unsqueeze(0).to(self.device)
         with torch.no_grad():
             q_values = self.model(state_tensor)
@@ -67,10 +118,8 @@ class StaticAgent:
         self.fixed_duration = fixed_duration
         self.normalize_max = max(1.0, float(normalize_max))
         try:
-            # Find the index of the desired fixed duration.
             self.duration_index = self.duration_options.index(self.fixed_duration)
         except ValueError:
-            # If the exact duration is not available, choose the closest one.
             self.duration_index = min(range(len(self.duration_options)), key=lambda i: abs(self.duration_options[i] - self.fixed_duration))
         self.current_lane = 0
 
@@ -82,129 +131,86 @@ class StaticAgent:
 def main():
     parser = argparse.ArgumentParser(description="Benchmark RL model against a static timer agent.")
     parser.add_argument("--model_path", type=str, default="rl_model.pth", help="Path to the trained RL model file.")
-    parser.add_argument("--num_steps", type=int, default=1000, help="Number of steps per simulation run.")
-    parser.add_argument("--num_runs", type=int, default=30, help="Number of simulation runs for statistical analysis.")
-    parser.add_argument("--num_lanes", type=int, default=4, help="Number of lanes/intersections (used to compute action space).")
-    parser.add_argument("--vehicle_types", type=str, default="", help="Comma-separated vehicle type names (e.g. car,truck). If empty, derived from config keys or defaults to car,truck.")
-    parser.add_argument("--normalize_max", type=float, default=50.0, help="Normalization max used in training.")
-    parser.add_argument("--use_model_action_space", action='store_true', help="If set, derive environment action-space (duration options) from the model checkpoint output size.")
-    parser.add_argument("--min_duration", type=int, default=5, help="Minimum duration (seconds) when auto-generating duration options from model output size.")
-    parser.add_argument("--max_duration", type=int, default=60, help="Maximum duration (seconds) when auto-generating duration options from model output size.")
+    parser.add_argument("--num_runs", type=int, default=30, help="Number of simulation runs.")
+    parser.add_argument("--num_lanes", type=int, default=4, help="Number of lanes.")
+    parser.add_argument("--normalize_max", type=float, default=50.0, help="Normalization max.")
+    parser.add_argument("--use_model_action_space", action='store_true', help="Auto-adjust action space.")
+    parser.add_argument("--min_duration", type=int, default=5, help="Min duration.")
+    parser.add_argument("--max_duration", type=int, default=60, help="Max duration.")
     args = parser.parse_args()
 
-    # --- Environment and Model Parameters (should match training) ---
     num_lanes = int(args.num_lanes)
-    # Determine vehicle types: CLI -> config -> fallback
-    if args.vehicle_types:
-        vehicle_type_names = [v.strip() for v in args.vehicle_types.split(',') if v.strip()]
-    else:
-        try:
-            vehicle_type_names = list(config.VEHICLE_TYPE_WEIGHTS.keys())
-            if not vehicle_type_names:
-                vehicle_type_names = ['car', 'truck']
-        except Exception:
-            vehicle_type_names = ['car', 'truck']
+    try:
+        vehicle_type_names = list(config.VEHICLE_TYPE_WEIGHTS.keys())
+    except:
+        vehicle_type_names = ['car', 'truck']
 
     duration_options = getattr(config, 'DURATION_OPTIONS', [10, 20, 30])
     num_vehicle_types = len(vehicle_type_names)
-    v_end = num_lanes * (num_vehicle_types if num_vehicle_types > 0 else 1)
+    v_end = num_lanes * num_vehicle_types
     input_size = v_end + num_lanes + num_lanes + num_lanes
     output_size = num_lanes * len(duration_options)
 
-    # Decide device early so we can inspect checkpoints with correct map_location
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Try to inspect the model checkpoint and auto-adapt the action space when needed.
+    
     try:
         ckpt = torch.load(args.model_path, map_location=device)
         inferred_output = None
         if isinstance(ckpt, dict):
-            for k in ('adv_head.weight', 'adv_head.bias', 'value_head.weight', 'value_head.bias'):
+            for k in ('adv_head.weight', 'adv_head.bias'):
                 if k in ckpt:
-                    param = ckpt[k]
-                    if hasattr(param, 'shape'):
-                        inferred_output = int(param.shape[0])
-                        break
+                    inferred_output = int(ckpt[k].shape[0])
+                    break
         if inferred_output is not None and inferred_output != output_size:
-            # If the user explicitly requested use_model_action_space or we detect a mismatch, adapt.
-            if args.use_model_action_space or True:
-                if inferred_output % num_lanes != 0:
-                    raise RuntimeError(f"Inferred model output size {inferred_output} is not divisible by num_lanes={num_lanes}; cannot derive duration options.")
-                num_duration_options = inferred_output // num_lanes
-                min_d = int(args.min_duration)
-                max_d = int(args.max_duration)
-                if num_duration_options == 1:
-                    duration_options = [min_d]
-                else:
-                    step = (max_d - min_d) / (num_duration_options - 1)
-                    duration_options = [int(round(min_d + i * step)) for i in range(num_duration_options)]
-                output_size = inferred_output
-                print(f"Adapted duration options from model checkpoint: {duration_options} (num options: {num_duration_options})")
-    except FileNotFoundError:
-        print(f"Model file {args.model_path} not found; proceeding with config duration options.")
-    except Exception as e:
-        raise RuntimeError(f"Failed to inspect/adapt action space from model: {e}")
+            num_duration_options = inferred_output // num_lanes
+            min_d, max_d = int(args.min_duration), int(args.max_duration)
+            step = (max_d - min_d) / (num_duration_options - 1) if num_duration_options > 1 else 0
+            duration_options = [int(round(min_d + i * step)) for i in range(num_duration_options)]
+            output_size = inferred_output
+            print(f"Adapted duration options: {duration_options}")
+    except:
+        pass
 
-    # --- Initialize Environment and Agents ---
-    # derive vehicle weights from config if available
     try:
         vt_weights = [float(config.VEHICLE_TYPE_WEIGHTS.get(vt, 1.0)) for vt in vehicle_type_names]
-    except Exception:
-        vt_weights = None
+    except:
+        vt_weights = [1.0, 2.0]
 
-    env = TrafficEnv(num_lanes=num_lanes, vehicle_type_names=vehicle_type_names, vehicle_weights=vt_weights, duration_options=duration_options)
+    env = TrafficEnv(num_lanes=num_lanes, vehicle_type_names=vehicle_type_names, vehicle_weights=vt_weights, duration_options=duration_options, use_time_varying_arrival_rate=True)
     rl_agent = RLAgent(args.model_path, input_size, output_size, device, normalize_max=args.normalize_max)
     static_agent = StaticAgent(num_lanes, duration_options, fixed_duration=30)
 
-    # --- Run Benchmark Simulations ---
-    print(f"\nRunning {args.num_runs} episodes each (simulated time = {env.max_time}s per episode)...")
-    
-    rl_waiting_times = []
-    for i in range(args.num_runs):
-        print(f"  RL Agent Run {i+1}/{args.num_runs}...", end='\r')
-        waiting_time = run_simulation(env, rl_agent)
-        rl_waiting_times.append(waiting_time)
-    print("\nRL agent simulations complete.")
+    print(f"\nRunning {args.num_runs} episodes...")
+    rl_results = [run_simulation(env, rl_agent) for _ in range(args.num_runs)]
+    static_results = [run_simulation(env, static_agent) for _ in range(args.num_runs)]
 
-    static_waiting_times = []
-    for i in range(args.num_runs):
-        print(f"  Static Agent Run {i+1}/{args.num_runs}...", end='\r')
-        waiting_time = run_simulation(env, static_agent)
-        static_waiting_times.append(waiting_time)
-    print("\nStatic agent simulations complete.")
+    def get_stats(results):
+        keys = results[0].keys()
+        return {k: (statistics.mean([r[k] for r in results]), statistics.stdev([r[k] for r in results])) for k in keys}
 
-    # --- Calculate Statistics ---
-    # Convert numpy types to float for compatibility with statistics module
-    rl_waiting_times_float = [float(x) for x in rl_waiting_times]
-    static_waiting_times_float = [float(x) for x in static_waiting_times]
+    rl_stats = get_stats(rl_results)
+    static_stats = get_stats(static_results)
 
-    rl_mean = statistics.mean(rl_waiting_times_float)
-    rl_std = statistics.stdev(rl_waiting_times_float) if args.num_runs > 1 else 0
-
-    static_mean = statistics.mean(static_waiting_times_float)
-    static_std = statistics.stdev(static_waiting_times_float) if args.num_runs > 1 else 0
-
-    # --- Display Results ---
     print("\n--- Benchmark Results ---")
-    print(f"Number of simulation runs: {args.num_runs}")
-    print(f"Simulated time per episode: {env.max_time}s")
-    print("-" * 30)
-    print("RL Agent:")
-    print(f"  Mean Total Waiting Time: {rl_mean:.2f}")
-    print(f"  Standard Deviation:      {rl_std:.2f}")
-    print("-" * 30)
-    print("Static Agent (30s):")
-    print(f"  Mean Total Waiting Time: {static_mean:.2f}")
-    print(f"  Standard Deviation:      {static_std:.2f}")
-    print("-" * 30)
-
-    if static_mean > 0:
-        improvement = ((static_mean - rl_mean) / static_mean) * 100
-        print(f"Improvement of RL over Static: {improvement:.2f}%")
-    else:
-        print("Static agent had zero waiting time, cannot calculate improvement.")
-
+    print("-" * 75)
+    print(f"{'Metric':<25} | {'Static (30s)':<15} | {'ATCS (RL)':<15} | {'Diff (%)':<10}")
+    print("-" * 75)
+    
+    metrics = [
+        ("avg_queue_len", "Avg Queue Length"),
+        ("max_wait_time", "Max Wait Time (s)"),
+        ("throughput", "Throughput (Weight)"),
+        ("emergency_delay", "Emergency Delay (s)")
+    ]
+    for key, name in metrics:
+        s_val, r_val = static_stats[key][0], rl_stats[key][0]
+        diff = ((r_val - s_val) / s_val * 100) if s_val != 0 else 0
+        print(f"{name:<25} | {s_val:<15.2f} | {r_val:<15.2f} | {diff:<10.2f}%")
+    
+    s_press, r_press = -static_stats['total_reward'][0], -rl_stats['total_reward'][0]
+    press_diff = ((r_press - s_press) / s_press * 100) if s_press != 0 else 0
+    print(f"{'Wait Pressure (Reward)':<25} | {s_press:<15.2f} | {r_press:<15.2f} | {press_diff:<10.2f}%")
+    print("-" * 75)
 
 if __name__ == "__main__":
     main()
