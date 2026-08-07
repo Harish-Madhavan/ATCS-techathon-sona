@@ -1,8 +1,9 @@
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from traffic_logic import TrafficLightController
-import config, time
+from core.traffic_logic import TrafficLightController
+from core import config
+import time
 
 ctrl = TrafficLightController(config.TRAFFIC_LIGHT_CONFIG, config.VEHICLE_TYPE_WEIGHTS, config.DEFAULT_VEHICLE_WEIGHT)
 state = ctrl.intersections['Intersection1']

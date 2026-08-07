@@ -2,15 +2,20 @@ import torch
 import numpy as np
 import argparse
 import statistics
-import config
+from core import config
 
-from train import TrafficEnv, DuelingQNetwork
+from rl_model.environment import TrafficEnv
+from rl_model.network import DuelingQNetwork
 
 def run_simulation(env, agent):
     """
     Run one episode of simulation until done (simulated time exhausted).
     Returns a dictionary of metrics.
     """
+    # Reset any stateful agent (e.g. StaticAgent lane counter) so every episode
+    # starts from the same configuration for reproducible, fair comparisons.
+    if hasattr(agent, 'reset'):
+        agent.reset()
     state = env.reset()
     state = env.normalize_state(state, agent.normalize_max)
     total_reward = 0
@@ -36,23 +41,16 @@ def run_simulation(env, agent):
         action = agent.choose_action(state, env)
         
         # Step the environment
-        # We need to know how many vehicles passed. 
-        # Since env.step doesn't return it, let's look at how it calculates it.
-        # vehicles_passed = min(available, can_pass) ...
-        # Let's modify env.step to return this, or just calculate it here.
-        # Actually, let's just use the reward cleared_value as a proxy if we can.
-        # Or better, just sum up the weight of vehicles cleared.
+        next_state, reward, done, info = env.step(action)
         
-        # To get the actual count, I'd have to modify train.py.
-        # Let's check if I can modify train.py safely.
-        
-        next_state, reward, done, _ = env.step(action)
-        
-        # We can estimate vehicles cleared from reward if we know the penalty.
-        # Reward = cleared_value - current_queue_weight * 0.1
-        # cleared_value = reward + current_queue_weight * 0.1
-        current_queue_weight = float(np.sum(env.state_vehicle_counts * env.vehicle_weights))
-        cleared_value = reward + current_queue_weight * 0.1
+        # Read throughput from info dict with fallback
+        if isinstance(info, dict) and "cleared_value" in info:
+            cleared_value = info["cleared_value"]
+        else:
+            # Fallback calculation
+            current_queue_weight = float(np.sum(env.state_vehicle_counts * env.vehicle_weights))
+            cleared_value = max(0.0, reward + current_queue_weight * 0.025)
+            
         total_cleared += cleared_value
 
         next_state = env.normalize_state(next_state, agent.normalize_max)
@@ -94,7 +92,7 @@ class RLAgent:
                             inferred_output = int(param.shape[0])
                             break
         if inferred_output is not None and inferred_output != output_size:
-            raise RuntimeError(f"Model mismatch. Use --use_model_action_space.")
+            raise RuntimeError(f"Model mismatch: output size {inferred_output} vs expected {output_size}.")
 
         self.model = DuelingQNetwork(input_size, output_size)
         self.model.load_state_dict(ckpt)
@@ -107,6 +105,23 @@ class RLAgent:
         state_tensor = torch.FloatTensor(np.array(state, dtype=float)).unsqueeze(0).to(self.device)
         with torch.no_grad():
             q_values = self.model(state_tensor)
+        
+        # Apply action masking using env if available
+        if env is not None:
+            max_repeat = getattr(config, 'MAX_CONSECUTIVE_RL_SAME_LANE', 2)
+            if env.consecutive_lane_count >= max_repeat:
+                duration_options = getattr(config, 'DURATION_OPTIONS', [10, 20, 30])
+                num_duration_options = len(duration_options)
+                q_np = q_values.cpu().numpy()[0]
+                mask = np.ones_like(q_np, dtype=bool)
+                for a_idx in range(len(q_np)):
+                    if int(a_idx // num_duration_options) == env.current_lane:
+                        mask[a_idx] = False
+                if mask.any():
+                    masked_q = np.copy(q_np)
+                    masked_q[~mask] = -1e9
+                    return int(np.argmax(masked_q))
+                    
         return int(torch.argmax(q_values).item())
 
 class StaticAgent:
@@ -123,14 +138,44 @@ class StaticAgent:
             self.duration_index = min(range(len(self.duration_options)), key=lambda i: abs(self.duration_options[i] - self.fixed_duration))
         self.current_lane = 0
 
+    def reset(self):
+        """Reset lane pointer so each benchmarked episode starts from lane 0."""
+        self.current_lane = 0
+
     def choose_action(self, state, env=None):
         action = self.current_lane * self.num_duration_options + self.duration_index
         self.current_lane = (self.current_lane + 1) % self.num_lanes
         return action
 
+class GreedyAgent:
+    """Agent that greedily selects the lane with the highest queue weight, prioritizing emergency vehicles."""
+    def __init__(self, num_lanes, duration_options, fixed_duration=20, normalize_max=50.0):
+        self.num_lanes = num_lanes
+        self.duration_options = duration_options
+        self.num_duration_options = len(duration_options)
+        self.normalize_max = max(1.0, float(normalize_max))
+        try:
+            self.duration_index = self.duration_options.index(fixed_duration)
+        except ValueError:
+            self.duration_index = min(range(len(self.duration_options)), key=lambda i: abs(self.duration_options[i] - fixed_duration))
+
+    def choose_action(self, state, env=None):
+        if env is not None:
+            # Check for ambulances
+            for ln in range(self.num_lanes):
+                if env.ambulance_presence[ln] > 0:
+                    return ln * self.num_duration_options + self.duration_index
+            
+            # Greedy select lane with highest pre-demand
+            demands = np.sum(env.state_vehicle_counts * env.vehicle_weights, axis=1)
+            lane = int(np.argmax(demands))
+        else:
+            lane = 0
+        return lane * self.num_duration_options + self.duration_index
+
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark RL model against a static timer agent.")
-    parser.add_argument("--model_path", type=str, default="rl_model.pth", help="Path to the trained RL model file.")
+    parser = argparse.ArgumentParser(description="Benchmark RL model against a static timer agent and greedy preemption agent.")
+    parser.add_argument("--model_path", type=str, default=config.RL_MODEL_PATH, help="Path to the trained RL model file.")
     parser.add_argument("--num_runs", type=int, default=30, help="Number of simulation runs.")
     parser.add_argument("--num_lanes", type=int, default=4, help="Number of lanes.")
     parser.add_argument("--normalize_max", type=float, default=50.0, help="Normalization max.")
@@ -141,7 +186,7 @@ def main():
 
     num_lanes = int(args.num_lanes)
     try:
-        vehicle_type_names = list(config.VEHICLE_TYPE_WEIGHTS.keys())
+        vehicle_type_names = getattr(config, 'TARGET_CLASSES', list(config.VEHICLE_TYPE_WEIGHTS.keys()))
     except:
         vehicle_type_names = ['car', 'truck']
 
@@ -167,7 +212,7 @@ def main():
             step = (max_d - min_d) / (num_duration_options - 1) if num_duration_options > 1 else 0
             duration_options = [int(round(min_d + i * step)) for i in range(num_duration_options)]
             output_size = inferred_output
-            print(f"Adapted duration options: {duration_options}")
+            print(f"Adapted duration options from model: {duration_options}")
     except:
         pass
 
@@ -177,24 +222,51 @@ def main():
         vt_weights = [1.0, 2.0]
 
     env = TrafficEnv(num_lanes=num_lanes, vehicle_type_names=vehicle_type_names, vehicle_weights=vt_weights, duration_options=duration_options, use_time_varying_arrival_rate=True)
-    rl_agent = RLAgent(args.model_path, input_size, output_size, device, normalize_max=args.normalize_max)
-    static_agent = StaticAgent(num_lanes, duration_options, fixed_duration=30)
+    
+    rl_agent = None
+    model_loaded = False
+    try:
+        rl_agent = RLAgent(args.model_path, input_size, output_size, device, normalize_max=args.normalize_max)
+        model_loaded = True
+    except Exception as e:
+        print(f"\nWarning: Could not load RL model at '{args.model_path}' ({e}).\nBenchmarking will compare baselines (Static vs Greedy Preemption) only.")
 
-    print(f"\nRunning {args.num_runs} episodes...")
-    rl_results = [run_simulation(env, rl_agent) for _ in range(args.num_runs)]
+    static_agent = StaticAgent(num_lanes, duration_options, fixed_duration=30)
+    greedy_agent = GreedyAgent(num_lanes, duration_options, fixed_duration=20)
+
+    print(f"\nRunning {args.num_runs} simulation episodes...")
+    
+    # Evaluate Static Agent
+    np.random.seed(42)
+    torch.manual_seed(42)
     static_results = [run_simulation(env, static_agent) for _ in range(args.num_runs)]
+    
+    # Evaluate Greedy Agent
+    np.random.seed(42)
+    torch.manual_seed(42)
+    greedy_results = [run_simulation(env, greedy_agent) for _ in range(args.num_runs)]
+    
+    # Evaluate RL Agent
+    if model_loaded:
+        np.random.seed(42)
+        torch.manual_seed(42)
+        rl_results = [run_simulation(env, rl_agent) for _ in range(args.num_runs)]
+    else:
+        rl_results = None
 
     def get_stats(results):
         keys = results[0].keys()
         return {k: (statistics.mean([r[k] for r in results]), statistics.stdev([r[k] for r in results])) for k in keys}
 
-    rl_stats = get_stats(rl_results)
     static_stats = get_stats(static_results)
+    greedy_stats = get_stats(greedy_results)
+    rl_stats = get_stats(rl_results) if model_loaded else None
 
-    print("\n--- Benchmark Results ---")
-    print("-" * 75)
-    print(f"{'Metric':<25} | {'Static (30s)':<15} | {'ATCS (RL)':<15} | {'Diff (%)':<10}")
-    print("-" * 75)
+    print("\n" + "=" * 90)
+    print(" " * 25 + "ADAPTIVE TRAFFIC CONTROL SYSTEM BENCHMARK")
+    print("=" * 90)
+    print(f"{'Metric':<25} | {'Static (30s)':<18} | {'Greedy (Preempt)':<18} | {'ATCS (RL)':<18}")
+    print("-" * 90)
     
     metrics = [
         ("avg_queue_len", "Avg Queue Length"),
@@ -203,14 +275,65 @@ def main():
         ("emergency_delay", "Emergency Delay (s)")
     ]
     for key, name in metrics:
-        s_val, r_val = static_stats[key][0], rl_stats[key][0]
-        diff = ((r_val - s_val) / s_val * 100) if s_val != 0 else 0
-        print(f"{name:<25} | {s_val:<15.2f} | {r_val:<15.2f} | {diff:<10.2f}%")
+        s_val, s_std = static_stats[key]
+        g_val, g_std = greedy_stats[key]
+        
+        s_str = f"{s_val:<7.2f} +/- {s_std:<5.1f}"
+        g_str = f"{g_val:<7.2f} +/- {g_std:<5.1f}"
+        
+        if model_loaded:
+            r_val, r_std = rl_stats[key]
+            r_str = f"{r_val:<7.2f} +/- {r_std:<5.1f}"
+        else:
+            r_str = "N/A"
+            
+        print(f"{name:<25} | {s_str:<18} | {g_str:<18} | {r_str:<18}")
     
-    s_press, r_press = -static_stats['total_reward'][0], -rl_stats['total_reward'][0]
-    press_diff = ((r_press - s_press) / s_press * 100) if s_press != 0 else 0
-    print(f"{'Wait Pressure (Reward)':<25} | {s_press:<15.2f} | {r_press:<15.2f} | {press_diff:<10.2f}%")
-    print("-" * 75)
+    s_reward, s_r_std = static_stats['total_reward']
+    g_reward, g_r_std = greedy_stats['total_reward']
+    s_reward_str = f"{s_reward:<7.1f} +/- {s_r_std:<5.1f}"
+    g_reward_str = f"{g_reward:<7.1f} +/- {g_r_std:<5.1f}"
+    
+    if model_loaded:
+        r_reward, r_r_std = rl_stats['total_reward']
+        r_reward_str = f"{r_reward:<7.1f} +/- {r_r_std:<5.1f}"
+    else:
+        r_reward_str = "N/A"
+        
+    print("-" * 90)
+    print(f"{'Average Episode Reward':<25} | {s_reward_str:<18} | {g_reward_str:<18} | {r_reward_str:<18}")
+    print("=" * 90)
+    
+    # Print improvement percentages if RL was loaded
+    if model_loaded:
+        print("\nImprovement of ATCS (RL) over baselines:")
+        for key, name in metrics:
+            s_val = static_stats[key][0]
+            g_val = greedy_stats[key][0]
+            r_val = rl_stats[key][0]
+            
+            # Lower is better for all except throughput
+            is_throughput = (key == "throughput")
+            
+            # Over static
+            if s_val != 0:
+                diff_s = ((r_val - s_val) / s_val * 100)
+                if not is_throughput:
+                    diff_s = -diff_s  # positive diff means improvement
+                s_imp_str = f"{diff_s:+.1f}%"
+            else:
+                s_imp_str = "N/A"
+                
+            # Over greedy
+            if g_val != 0:
+                diff_g = ((r_val - g_val) / g_val * 100)
+                if not is_throughput:
+                    diff_g = -diff_g  # positive diff means improvement
+                g_imp_str = f"{diff_g:+.1f}%"
+            else:
+                g_imp_str = "N/A"
+                
+            print(f"  * {name:<23}: {s_imp_str:<10} better than Static  |  {g_imp_str:<10} better than Greedy")
 
 if __name__ == "__main__":
     main()

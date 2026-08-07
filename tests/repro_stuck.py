@@ -3,8 +3,8 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import time
-from traffic_logic import TrafficLightController
-import config
+from core.traffic_logic import TrafficLightController
+from core import config
 
 
 def run_sim(duration=120):
