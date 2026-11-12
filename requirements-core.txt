@@ -1,0 +1,5 @@
+# Minimal deps for unit tests + RL simulation (no vision/GUI/hardware).
+# Install: pip install -r requirements-core.txt
+# For full system (YOLO, GUI, ESP32, Intel XPU): pip install -r requirements.txt
+numpy>=1.24
+torch>=2.0

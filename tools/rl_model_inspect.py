@@ -20,17 +20,21 @@ import torch
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-import config
-from train import DuelingQNetwork
+from core import config
+from rl_model.network import DuelingQNetwork
+from rl_model.device import get_best_device
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = get_best_device()
 
 
 def load_checkpoint(path):
     if not os.path.exists(path):
         print(f"Model file not found: {path}")
         return None
-    ckpt = torch.load(path, map_location=DEVICE)
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+    # Unwrap new metadata format {version, input_size, output_size, state_dict}.
+    if isinstance(ckpt, dict) and "state_dict" in ckpt and "fc1.weight" not in ckpt:
+        return ckpt["state_dict"]
     return ckpt
 
 
@@ -212,14 +216,13 @@ if __name__ == '__main__':
         alt[i] = (i % 5) * 1.0
     tests['alt'] = alt
 
+    from rl_model.environment import TrafficEnv
+
     def normalize_runtime_state(state, normalize_max, num_lanes, num_vehicle_types):
-        v_end = num_lanes * num_vehicle_types
-        w_end = v_end + num_lanes
-        normalized = state.copy()
-        normalized[:v_end] = normalized[:v_end] / max(1.0, float(normalize_max))
-        if len(normalized) >= w_end:
-            normalized[v_end:w_end] = normalized[v_end:w_end] / 100.0
-        return normalized
+        # Use the single canonical normalizer so inspector matches training/GUI.
+        return TrafficEnv.normalize_state_vector(
+            np.array(state, dtype=float), num_lanes, num_vehicle_types, normalize_max
+        )
 
     normalize_max = getattr(config, 'RL_NORMALIZE_MAX', 50.0)
     for name, st in tests.items():

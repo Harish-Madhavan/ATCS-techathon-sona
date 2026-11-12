@@ -75,10 +75,16 @@ ESP32_APPROACH_MAPPING = {
     "Westbound": "W",
     "Southbound": "S"
 }
+VERBOSE = False
 RL_MODEL_ENABLED = True
 RL_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "rl_model.pth")
+RL_NORMALIZE_MAX = 50.0
 # Discrete green duration options the RL agent will be trained with.
 # A curated set balances granularity with action-space tractability (4 lanes × 12 = 48 actions).
 DURATION_OPTIONS = [5, 8, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60]
 # Maximum allowed consecutive RL selections for the same lane before forcing variation
 MAX_CONSECUTIVE_RL_SAME_LANE = 2
+# Starvation safety: if a lane waits longer than this, force-serve it
+# (overrides repeat limiter but never overrides manual red or emergency preemption).
+STARVATION_ENABLED = True
+STARVATION_WAIT_S = 180.0

@@ -2,10 +2,13 @@ import torch
 import numpy as np
 import argparse
 import statistics
+import os
+import json
 from core import config
 
 from rl_model.environment import TrafficEnv
-from rl_model.network import DuelingQNetwork
+from rl_model.device import get_best_device
+from rl_model.agents import RLAgent, StaticAgent, GreedyAgent
 
 def run_simulation(env, agent):
     """
@@ -76,104 +79,7 @@ def run_simulation(env, agent):
         "throughput": total_cleared
     }
 
-class RLAgent:
-    """Agent that uses a trained Q-network to make decisions."""
-    def __init__(self, model_path, input_size, output_size, device, normalize_max=50.0):
-        
-        ckpt = torch.load(model_path, map_location=device)
-        
-        inferred_output = None
-        if isinstance(ckpt, dict):
-            for k in ('adv_head.weight', 'adv_head.bias', 'value_head.weight', 'value_head.bias'):
-                if k in ckpt:
-                    param = ckpt[k]
-                    if hasattr(param, 'shape'):
-                        if len(param.shape) >= 1:
-                            inferred_output = int(param.shape[0])
-                            break
-        if inferred_output is not None and inferred_output != output_size:
-            raise RuntimeError(f"Model mismatch: output size {inferred_output} vs expected {output_size}.")
-
-        self.model = DuelingQNetwork(input_size, output_size)
-        self.model.load_state_dict(ckpt)
-        self.model.to(device)
-        self.model.eval()
-        self.device = device
-        self.normalize_max = max(1.0, float(normalize_max))
-
-    def choose_action(self, state, env=None):
-        state_tensor = torch.FloatTensor(np.array(state, dtype=float)).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            q_values = self.model(state_tensor)
-        
-        # Apply action masking using env if available
-        if env is not None:
-            max_repeat = getattr(config, 'MAX_CONSECUTIVE_RL_SAME_LANE', 2)
-            if env.consecutive_lane_count >= max_repeat:
-                duration_options = getattr(config, 'DURATION_OPTIONS', [10, 20, 30])
-                num_duration_options = len(duration_options)
-                q_np = q_values.cpu().numpy()[0]
-                mask = np.ones_like(q_np, dtype=bool)
-                for a_idx in range(len(q_np)):
-                    if int(a_idx // num_duration_options) == env.current_lane:
-                        mask[a_idx] = False
-                if mask.any():
-                    masked_q = np.copy(q_np)
-                    masked_q[~mask] = -1e9
-                    return int(np.argmax(masked_q))
-                    
-        return int(torch.argmax(q_values).item())
-
-class StaticAgent:
-    """Agent that cycles through lanes with a fixed green light duration."""
-    def __init__(self, num_lanes, duration_options, fixed_duration=30, normalize_max=50.0):
-        self.num_lanes = num_lanes
-        self.duration_options = duration_options
-        self.num_duration_options = len(duration_options)
-        self.fixed_duration = fixed_duration
-        self.normalize_max = max(1.0, float(normalize_max))
-        try:
-            self.duration_index = self.duration_options.index(self.fixed_duration)
-        except ValueError:
-            self.duration_index = min(range(len(self.duration_options)), key=lambda i: abs(self.duration_options[i] - self.fixed_duration))
-        self.current_lane = 0
-
-    def reset(self):
-        """Reset lane pointer so each benchmarked episode starts from lane 0."""
-        self.current_lane = 0
-
-    def choose_action(self, state, env=None):
-        action = self.current_lane * self.num_duration_options + self.duration_index
-        self.current_lane = (self.current_lane + 1) % self.num_lanes
-        return action
-
-class GreedyAgent:
-    """Agent that greedily selects the lane with the highest queue weight, prioritizing emergency vehicles."""
-    def __init__(self, num_lanes, duration_options, fixed_duration=20, normalize_max=50.0):
-        self.num_lanes = num_lanes
-        self.duration_options = duration_options
-        self.num_duration_options = len(duration_options)
-        self.normalize_max = max(1.0, float(normalize_max))
-        try:
-            self.duration_index = self.duration_options.index(fixed_duration)
-        except ValueError:
-            self.duration_index = min(range(len(self.duration_options)), key=lambda i: abs(self.duration_options[i] - fixed_duration))
-
-    def choose_action(self, state, env=None):
-        if env is not None:
-            # Check for ambulances
-            for ln in range(self.num_lanes):
-                if env.ambulance_presence[ln] > 0:
-                    return ln * self.num_duration_options + self.duration_index
-            
-            # Greedy select lane with highest pre-demand
-            demands = np.sum(env.state_vehicle_counts * env.vehicle_weights, axis=1)
-            lane = int(np.argmax(demands))
-        else:
-            lane = 0
-        return lane * self.num_duration_options + self.duration_index
-
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Benchmark RL model against a static timer agent and greedy preemption agent.")
     parser.add_argument("--model_path", type=str, default=config.RL_MODEL_PATH, help="Path to the trained RL model file.")
     parser.add_argument("--num_runs", type=int, default=30, help="Number of simulation runs.")
@@ -182,7 +88,8 @@ def main():
     parser.add_argument("--use_model_action_space", action='store_true', help="Auto-adjust action space.")
     parser.add_argument("--min_duration", type=int, default=5, help="Min duration.")
     parser.add_argument("--max_duration", type=int, default=60, help="Max duration.")
-    args = parser.parse_args()
+    parser.add_argument("--output_json", type=str, default=None, help="Optional path to export benchmark results as JSON.")
+    args = parser.parse_args(argv)
 
     num_lanes = int(args.num_lanes)
     try:
@@ -196,7 +103,7 @@ def main():
     input_size = v_end + num_lanes + num_lanes + num_lanes
     output_size = num_lanes * len(duration_options)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_best_device()
     
     try:
         ckpt = torch.load(args.model_path, map_location=device)
@@ -239,17 +146,20 @@ def main():
     # Evaluate Static Agent
     np.random.seed(42)
     torch.manual_seed(42)
+    env.seed(42)
     static_results = [run_simulation(env, static_agent) for _ in range(args.num_runs)]
-    
+
     # Evaluate Greedy Agent
     np.random.seed(42)
     torch.manual_seed(42)
+    env.seed(42)
     greedy_results = [run_simulation(env, greedy_agent) for _ in range(args.num_runs)]
-    
+
     # Evaluate RL Agent
     if model_loaded:
         np.random.seed(42)
         torch.manual_seed(42)
+        env.seed(42)
         rl_results = [run_simulation(env, rl_agent) for _ in range(args.num_runs)]
     else:
         rl_results = None
@@ -334,6 +244,24 @@ def main():
                 g_imp_str = "N/A"
                 
             print(f"  * {name:<23}: {s_imp_str:<10} better than Static  |  {g_imp_str:<10} better than Greedy")
+
+    if args.output_json:
+        export_data = {
+            "num_runs": args.num_runs,
+            "static": {k: {"mean": float(v[0]), "std": float(v[1])} for k, v in static_stats.items()},
+            "greedy": {k: {"mean": float(v[0]), "std": float(v[1])} for k, v in greedy_stats.items()},
+        }
+        if rl_stats:
+            export_data["rl"] = {k: {"mean": float(v[0]), "std": float(v[1])} for k, v in rl_stats.items()}
+        try:
+            out_dir = os.path.dirname(args.output_json)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(args.output_json, "w") as f:
+                json.dump(export_data, f, indent=2)
+            print(f"\n[Benchmark] Results successfully exported to: {args.output_json}")
+        except Exception as e_json:
+            print(f"\n[Benchmark Error] Failed to export JSON results: {e_json}")
 
 if __name__ == "__main__":
     main()

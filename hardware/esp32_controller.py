@@ -9,10 +9,21 @@ class ESP32SerialController:
     def __init__(self, port, baudrate, approach_mapping):
         self.port = port
         self.baudrate = baudrate
-        self.approach_mapping = approach_mapping 
+        self.approach_mapping = dict(approach_mapping or {})
         self.serial_connection = None
         self.is_connected = False
         self._connect()
+
+    @property
+    def is_mock(self):
+        return str(self.port).upper() == "MOCK"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
     def _connect(self):
         if str(self.port).upper() == "MOCK":
@@ -52,19 +63,33 @@ class ESP32SerialController:
             return
 
         command_parts = []
-        for approach_name, status_info in approach_statuses.items():
+        for approach_name in sorted(approach_statuses):
+            status_info = approach_statuses[approach_name] or {}
             short_code = self.approach_mapping.get(approach_name)
             if short_code:
-                light_state_char = status_info.get('state', 'RED')[0].upper() 
-                if light_state_char not in ('R', 'Y', 'G'): 
-                    light_state_char = 'R' 
+                raw_state = str(status_info.get('state', 'RED')).upper()
+                light_state_char = raw_state[0] if raw_state else 'R'
+                if light_state_char not in ('R', 'Y', 'G'):
+                    light_state_char = 'R'
                 command_parts.append(f"{short_code}:{light_state_char}")
-        
+
         if not command_parts:
             return
 
         command_string = ",".join(command_parts) + "\n"
         self.send_command(command_string)
+
+    def build_command(self, approach_statuses):
+        """Pure helper for tests: deterministic command string without I/O."""
+        parts = []
+        for approach_name in sorted(approach_statuses or {}):
+            code = self.approach_mapping.get(approach_name)
+            if not code:
+                continue
+            raw = str((approach_statuses[approach_name] or {}).get('state', 'RED')).upper()
+            ch = raw[0] if raw else 'R'
+            parts.append(f"{code}:{ch if ch in ('R', 'Y', 'G') else 'R'}")
+        return ",".join(parts) + "\n" if parts else ""
 
     def send_command(self, command_string):
         """ Sends a formatted command string to the ESP32. """

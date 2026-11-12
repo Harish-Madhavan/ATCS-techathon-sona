@@ -1,5 +1,8 @@
 import time
 from collections import defaultdict
+from core.log import get_logger
+
+logger = get_logger(__name__)
 
 class IntersectionState(dict):
     def __init__(self, name, config, phases, intersection_approaches, timings, demand_threshold, vehicle_type_order):
@@ -47,7 +50,7 @@ class IntersectionState(dict):
             if self['ambulance_request_active'][approach_name]:
                 last_det_time = self['last_ambulance_detection_time'].get(approach_name, 0)
                 if current_time - last_det_time > timeout_duration:
-                    print(f"[{self['name']}] Ambulance request for {approach_name} timed out.")
+                    logger.info("[%s] Ambulance request for %s timed out.", self['name'], approach_name)
                     self['ambulance_request_active'][approach_name] = False
 
     def _check_for_emergency_preemption_need(self):
@@ -79,16 +82,18 @@ class IntersectionState(dict):
         if delta_time < 0:
             delta_time = 0.0
         if delta_time > max_delta:
-            print(f"[{self['name']}] Warning: Large time delta ({delta_time:.1f}s). Clamping to {max_delta}s.")
+            logger.warning("[%s] Large time delta (%.1fs). Clamping to %.1fs.", self['name'], delta_time, max_delta)
             delta_time = max_delta
-            
+
         self['state_timer'] += delta_time
         if self['current_state'] == "GREEN":
             self['green_timer'] += delta_time
-            try:
-                print(f"[{self['name']}] DEBUG: green_timer={self['green_timer']:.1f} max_green={self.get('current_cycle_max_green',0):.1f} rl_enforced={self.get('rl_enforced',False)}")
-            except Exception:
-                pass
+            logger.debug(
+                "[%s] green_timer=%.1f max_green=%.1f rl_enforced=%s",
+                self['name'], self['green_timer'],
+                self.get('current_cycle_max_green', 0),
+                self.get('rl_enforced', False),
+            )
         return delta_time
 
     def _update_wait_times(self, delta_time, current_green_approach):
@@ -96,7 +101,8 @@ class IntersectionState(dict):
             if self['current_state'] == "GREEN" and approach == current_green_approach:
                 self['approach_wait_time'][approach] = 0.0
             else:
-                if self['approach_demand'].get(approach, 0) > 0:
+                has_demand = (self['approach_demand'].get(approach, 0) > 0) or (self['approach_weighted_demand'].get(approach, 0.0) > 0.0)
+                if has_demand:
                     self['approach_wait_time'][approach] += delta_time
                 else:
                     self['approach_wait_time'][approach] = 0.0
@@ -117,7 +123,12 @@ class IntersectionState(dict):
                 if self['current_cycle_max_green'] < timings['absolute_max_green'] and self['last_weighted_flow_green'].get(green_approach, 0.0) >= timings['realtime_flow_min_weighted_demand']:
                     new_max_green = min(self['current_cycle_max_green'] + timings['realtime_flow_extension_increment'], timings['absolute_max_green'])
                     if new_max_green > self['current_cycle_max_green']:
-                        print(f"[{self['name']}] Extension: Approach '{green_approach}' extending max green {self['current_cycle_max_green']:.1f}s -> {new_max_green:.1f}s due to realtime flow {self['last_weighted_flow_green'].get(green_approach,0.0):.1f}")
+                        logger.debug(
+                            "[%s] Extension: %s %.1fs -> %.1fs (flow %.1f)",
+                            self['name'], green_approach,
+                            self['current_cycle_max_green'], new_max_green,
+                            self['last_weighted_flow_green'].get(green_approach, 0.0),
+                        )
                         self['current_cycle_max_green'] = new_max_green
                     self['last_weighted_flow_green'][green_approach] = 0.0
             except Exception:
@@ -168,7 +179,10 @@ class IntersectionState(dict):
             try:
                 target_emergency_approach_name = phases_config.get(self['target_emergency_phase_key'], ["Unknown"])[0]
                 if self["manual_override_red"].get(target_emergency_approach_name, False):
-                    print(f"[{self['name']}] Emergency target '{target_emergency_approach_name}' (Phase '{self['target_emergency_phase_key']}') is MANUALLY FORCED RED. Cannot service emergency.")
+                    logger.warning(
+                        "[%s] Emergency target '%s' is MANUALLY FORCED RED.",
+                        self['name'], target_emergency_approach_name,
+                    )
                     self['emergency_preemption_active'] = False 
                     self['target_emergency_phase_key'] = None
                     
@@ -184,12 +198,15 @@ class IntersectionState(dict):
                     if emergency_approaches_served:
                         served_approach_name = emergency_approaches_served[0]
                         if self['ambulance_request_active'].get(served_approach_name, False):
-                            print(f"[{self['name']}] Servicing ambulance for {served_approach_name} on phase '{self['target_emergency_phase_key']}'. Clearing request.")
+                            logger.info(
+                                "[%s] Servicing ambulance for %s. Clearing request.",
+                                self['name'], served_approach_name,
+                            )
                             self['ambulance_request_active'][served_approach_name] = False
                     
                     return "GREEN", switch_reason_prefix + f"Starting EMERGENCY Phase '{self['target_emergency_phase_key']}' for approach '{target_emergency_approach_name}'"
             except ValueError:
-                print(f"[{self['name']}] ERROR: Target emergency phase '{self['target_emergency_phase_key']}' not found. Reverting.")
+                logger.error("[%s] Target emergency phase '%s' not found.", self['name'], self['target_emergency_phase_key'])
                 self['emergency_preemption_active'] = False
                 self['target_emergency_phase_key'] = None
                 self['is_current_phase_emergency'] = False
@@ -215,11 +232,7 @@ class IntersectionState(dict):
                 chosen_duration = duration_options[chosen_duration_index]
                 next_phase_key_selected = phase_keys_list_ordered[chosen_lane_index]
 
-                try:
-                    from core import config as cfg
-                    max_repeat = getattr(cfg, 'MAX_CONSECUTIVE_RL_SAME_LANE', 2)
-                except Exception:
-                    max_repeat = 2
+                max_repeat = getattr(cfg, 'MAX_CONSECUTIVE_RL_SAME_LANE', 2)
 
                 last_rl_lane = self.get('last_rl_chosen_lane')
                 chosen_lane_name = next_phase_key_selected
@@ -250,26 +263,36 @@ class IntersectionState(dict):
                 else:
                     self['consecutive_rl_same_lane'] = 1
                 self['last_rl_chosen_lane'] = next_phase_key_selected
-                print(f"[{self['name']}] RL set rl_enforced=True for '{selected_approach_for_green_candidate}'")
-                print(f"[{self['name']}] RL set green for '{selected_approach_for_green_candidate}' to {self['current_cycle_max_green']:.1f}s (chosen_duration={chosen_duration})")
+                logger.debug(
+                    "[%s] RL green for '%s' to %.1fs (chosen=%s)",
+                    self['name'], selected_approach_for_green_candidate,
+                    self['current_cycle_max_green'], chosen_duration,
+                )
 
                 self['is_current_phase_emergency'] = False
                 
                 return "GREEN", switch_reason_prefix + f"RL CHOSE Phase '{next_phase_key_selected}' for approach '{selected_approach_for_green_candidate}' with duration {self['current_cycle_max_green']:.1f}s"
             except Exception as e_rl_decode:
-                print(f"[{self['name']}] Error decoding RL action: {e_rl_decode}")
+                logger.warning("[%s] Error decoding RL action: %s", self['name'], e_rl_decode)
                 rl_action = None
 
-        # 3. Fallback round-robin selection
-        print(f"[{self['name']}] No RL action provided; falling back to round-robin.")
+        # 3. Fallback round-robin selection (skipping manually forced red approaches)
+        logger.debug("[%s] No RL action; round-robin fallback.", self['name'])
         next_phase_idx = (self['current_phase_index'] + 1) % len(phase_keys_list)
+        for offset in range(1, len(phase_keys_list) + 1):
+            cand_idx = (self['current_phase_index'] + offset) % len(phase_keys_list)
+            cand_appr = phases_config.get(phase_keys_list[cand_idx], [None])[0]
+            if cand_appr and not self['manual_override_red'].get(cand_appr, False):
+                next_phase_idx = cand_idx
+                break
+
         self['current_phase_index'] = next_phase_idx
         selected_approach = phases_config.get(phase_keys_list[next_phase_idx], ["Unknown"])[0]
         self['current_cycle_max_green'] = timings.get('base_max_green', 20)
         self['is_current_phase_emergency'] = False
 
         if self['emergency_preemption_active'] and phase_keys_list[self['current_phase_index']] != self['target_emergency_phase_key']:
-             print(f"[{self['name']}] Emergency preemption for '{self['target_emergency_phase_key']}' concluded as normal phase '{phase_keys_list[self['current_phase_index']]}' starts.")
+             logger.info("[%s] Emergency preemption concluded.", self['name'])
              self['emergency_preemption_active'] = False
              self['target_emergency_phase_key'] = None
 
@@ -278,7 +301,11 @@ class IntersectionState(dict):
     def _apply_state_change(self, current_time, next_state, switch_reason, timings, phases_config, phase_keys_list, current_phase_key_on_entry):
         current_phase_key_display = phase_keys_list[self['current_phase_index']]
         current_approach_display = phases_config.get(current_phase_key_display, ["Unknown"])[0]
-        print(f"[{self['name']}] State Change: {self['current_state']} -> {next_state}. (Phase: {current_phase_key_display} for Appr: {current_approach_display}, Reason: {switch_reason})")
+        logger.info(
+            "[%s] %s -> %s (Phase: %s, Reason: %s)",
+            self['name'], self['current_state'], next_state,
+            current_phase_key_display, switch_reason,
+        )
         
         if self['current_state'] == "YELLOW" and next_state == "ALL_RED":
              finished_approaches = phases_config.get(current_phase_key_on_entry, []) 
@@ -288,23 +315,25 @@ class IntersectionState(dict):
                  if not self["manual_override_red"].get(the_finished_approach, False):
                       self['approach_demand'][the_finished_approach] = 0 
                       self['approach_weighted_demand'][the_finished_approach] = 0.0
+                      if the_finished_approach in self['approach_counts_by_type']:
+                          self['approach_counts_by_type'][the_finished_approach] = {vt: 0 for vt in self['approach_counts_by_type'][the_finished_approach]}
                  if the_finished_approach in self['last_detection_time_green']:
                       del self['last_detection_time_green'][the_finished_approach]
                  if the_finished_approach in self['last_weighted_flow_green']:
                       del self['last_weighted_flow_green'][the_finished_approach]
              
              if self['is_current_phase_emergency']:
-                  print(f"[{self['name']}] Emergency phase '{current_phase_key_on_entry}' for approach '{current_approach_display}' cycle completed.")
-                  self['is_current_phase_emergency'] = False 
+                  logger.info("[%s] Emergency phase '%s' completed.", self['name'], current_phase_key_on_entry)
+                  self['is_current_phase_emergency'] = False
                   if self['emergency_preemption_active'] and self['target_emergency_phase_key'] == current_phase_key_on_entry:
                       another_emergency = self._check_for_emergency_preemption_need()
                       if not another_emergency:
-                          print(f"[{self['name']}] No further pending emergencies. Deactivating preemption mode.")
+                          logger.info("[%s] No further emergencies.", self['name'])
                           self['emergency_preemption_active'] = False
                           self['target_emergency_phase_key'] = None
                       else:
-                          print(f"[{self['name']}] Another emergency for '{another_emergency}' detected. Preemption remains active.")
-                          self['target_emergency_phase_key'] = another_emergency 
+                          logger.info("[%s] Another emergency for '%s'.", self['name'], another_emergency)
+                          self['target_emergency_phase_key'] = another_emergency
 
         self['current_state'] = next_state
         self['state_timer'] = 0.0
@@ -339,11 +368,21 @@ class IntersectionState(dict):
             if emergency_phase_needed:
                 self['emergency_preemption_active'] = True
                 self['target_emergency_phase_key'] = emergency_phase_needed
-                self['is_current_phase_emergency'] = False 
-                print(f"[{self['name']}] EMERGENCY PREEMPTION ACTIVATED for phase '{emergency_phase_needed}'.")
-                if self['current_state'] == "GREEN" and phase_keys_list[self['current_phase_index']] != emergency_phase_needed:
-                    next_state = "YELLOW"
-                    switch_reason = f"Emergency Preemption for '{emergency_phase_needed}'"
+                self['is_current_phase_emergency'] = False
+                logger.warning("[%s] EMERGENCY PREEMPTION for '%s'.", self['name'], emergency_phase_needed)
+                if self['current_state'] == "GREEN":
+                    if phase_keys_list[self['current_phase_index']] != emergency_phase_needed:
+                        next_state = "YELLOW"
+                        switch_reason = f"Emergency Preemption for '{emergency_phase_needed}'"
+                    else:
+                        # Emergency is on the CURRENT green approach — grant emergency green status directly
+                        self['is_current_phase_emergency'] = True
+                        logger.warning("[%s] Emergency on active GREEN '%s'. Upgrading directly.", self['name'], emergency_phase_needed)
+                        emergency_approaches = phases_config.get(emergency_phase_needed, [])
+                        if emergency_approaches:
+                            served_app = emergency_approaches[0]
+                            if self['ambulance_request_active'].get(served_app, False):
+                                self['ambulance_request_active'][served_app] = False
 
         current_phase_key_on_entry = phase_keys_list[self['current_phase_index']]
         current_phase_actual_approaches_on_entry = phases_config.get(current_phase_key_on_entry, [])

@@ -1,3 +1,30 @@
-mobileclip_blt.pt
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
 
+# Large / untracked model binaries
+mobileclip_blt.pt
 mobileclip_blt.ts
+*.legacy.pth
+
+# Benchmark and temporary outputs
+benchmark_results.json
+benchmarks/results/
+*.log
+runs/
+
+# Testing & Coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor & IDE artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Operating System Files
+.DS_Store
+Thumbs.db

@@ -46,8 +46,8 @@ class PolygonDefiner:
         self.current_points_list = [] 
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        instructions1 = "LClick=Add Point | RClick=Undo Last"
-        instructions2 = "'d'/Enter=Done | 'r'=Reset | 'q'/Esc=Skip"
+        instructions1 = "LClick=Add Point | RClick/u=Undo | r=Reset"
+        instructions2 = "Enter/d=Save ROI (Full Frame if 0 pts) | Esc/q=Skip"
         y0, dy = 30, 30
         
         cv2.putText(self.frame_display, instructions1, (10, y0), font, 0.6, (0, 0, 0), 3, cv2.LINE_AA) 
@@ -70,11 +70,17 @@ class PolygonDefiner:
                     print(f" -> Polygon defined for {approach_name} with {self.current_points_list}")
                     cap.release()
                     cv2.destroyWindow(self.window_name)
-                    
                     polygon_array = np.array(self.current_points_list, dtype=np.int32) 
                     return polygon_array
+                elif len(self.current_points_list) == 0:
+                    h, w = frame.shape[:2]
+                    default_polygon = [(0, 0), (w, 0), (w, h), (0, h)]
+                    print(f" -> No custom points selected for {approach_name}. Defaulting to full frame ROI.")
+                    cap.release()
+                    cv2.destroyWindow(self.window_name)
+                    return np.array(default_polygon, dtype=np.int32)
                 else:
-                    print(" -> Error: Need at least 3 points to define a polygon.")
+                    print(" -> Warning: Need at least 3 points to define a polygon (or reset with 'r' to use full frame).")
 
             elif key == ord('r'):
                 print(" -> Resetting points.")

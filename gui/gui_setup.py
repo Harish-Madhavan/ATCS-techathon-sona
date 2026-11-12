@@ -1,7 +1,19 @@
 import tkinter as tk
-from tkinter import font, filedialog, ttk
+from tkinter import font, filedialog, messagebox, ttk
 import os
 from core import config
+from core.log import get_logger
+
+logger = get_logger(__name__)
+
+def _default_browse_dir(current_path):
+    if current_path and os.path.exists(current_path):
+        d = os.path.dirname(current_path)
+        if os.path.isdir(d):
+            return d
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assets = os.path.join(root, "assets")
+    return assets if os.path.isdir(assets) else root
 
 class SetupDialog:
     def __init__(self, parent):
@@ -11,14 +23,16 @@ class SetupDialog:
         self.dialog.configure(bg="#121214")
         
         # Center the dialog
-        dialog_width = 650
-        dialog_height = 700
+        # Dynamically size and center the dialog based on available screen bounds
         screen_width = self.dialog.winfo_screenwidth()
         screen_height = self.dialog.winfo_screenheight()
+        dialog_width = min(680, max(560, screen_width - 40))
+        dialog_height = min(660, max(460, screen_height - 100))
         x = (screen_width // 2) - (dialog_width // 2)
-        y = (screen_height // 2) - (dialog_height // 2)
+        y = max(10, (screen_height // 2) - (dialog_height // 2) - 20)
         self.dialog.geometry(f"{dialog_width}x{dialog_height}+{x}+{y}")
-        self.dialog.resizable(False, False)
+        self.dialog.minsize(550, 440)
+        self.dialog.resizable(True, True)
         self.dialog.grab_set()  # Make it modal
         
         self.success = False
@@ -41,56 +55,116 @@ class SetupDialog:
         self.current_paths = {}
         for approach_name, video_path in config.VIDEO_PATHS:
             self.current_paths[approach_name] = tk.StringVar(value=video_path)
-            
-        header_frame = tk.Frame(self.dialog, bg="#121214")
-        header_frame.pack(fill=tk.X, pady=(20, 10), padx=20)
-        
+
+        # --- 1. PIN BOTTOM ACTION BAR FIRST (Guarantees visibility on all screen resolutions) ---
+        bottom_frame = tk.Frame(self.dialog, bg="#121214")
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=12, padx=20)
+
+        sep_bottom = tk.Frame(self.dialog, height=1, bg="#2C2C2E")
+        sep_bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 2))
+
+        btn_exit = tk.Button(
+            bottom_frame, text="Cancel / Exit", font=btn_font,
+            bg="#2C2C2E", fg="#FF453A", activebackground="#FF453A", activeforeground="white",
+            bd=0, relief="flat", width=15, pady=8, cursor="hand2", command=self._on_cancel
+        )
+        btn_exit.pack(side=tk.LEFT)
+
+        btn_start = tk.Button(
+            bottom_frame, text="Save & Proceed  (Enter ↵)", font=btn_font,
+            bg="#30D158", fg="black", activebackground="#248A3D", activeforeground="white",
+            bd=0, relief="flat", width=26, pady=8, cursor="hand2", command=self._on_start,
+            highlightthickness=2, highlightbackground="#30D158",
+        )
+        btn_start.pack(side=tk.RIGHT)
+        self._start_button = btn_start
+        self.dialog.after(100, lambda: btn_start.focus_set())
+
+        # Bind Enter / KP_Enter / Esc keyboard shortcuts
+        self.dialog.bind("<Return>", lambda e: self._on_start())
+        self.dialog.bind("<KP_Enter>", lambda e: self._on_start())
+        self.dialog.bind("<Escape>", lambda e: self._on_cancel())
+
+        # --- 2. SCROLLABLE CONTAINER FOR SETUP OPTIONS ---
+        canvas_container = tk.Frame(self.dialog, bg="#121214")
+        canvas_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        canvas = tk.Canvas(canvas_container, bg="#121214", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(canvas_container, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="#121214")
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self.dialog.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Header Frame inside scrollable area
+        header_frame = tk.Frame(scrollable_frame, bg="#121214")
+        header_frame.pack(fill=tk.X, pady=(15, 10), padx=20)
+
         lbl_title = tk.Label(header_frame, text="ADAPTIVE TRAFFIC LIGHT CONTROLLER", font=title_font, fg="#0A84FF", bg="#121214")
         lbl_title.pack(anchor=tk.W)
-        
-        lbl_subtitle = tk.Label(header_frame, text="Configure video inputs for each approach before starting simulation", font=regular_font, fg="#8E8E93", bg="#121214")
+
+        lbl_subtitle = tk.Label(header_frame, text="Configure video inputs for each approach. Click 'Save & Proceed' or press Enter to start.", font=regular_font, fg="#8E8E93", bg="#121214")
         lbl_subtitle.pack(anchor=tk.W, pady=(2, 0))
-        
-        sep = tk.Frame(self.dialog, height=1, bg="#2C2C2E")
+
+        sep = tk.Frame(scrollable_frame, height=1, bg="#2C2C2E")
         sep.pack(fill=tk.X, padx=20, pady=5)
-        
-        approaches_frame = tk.Frame(self.dialog, bg="#121214")
-        approaches_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-        
+
+        approaches_frame = tk.Frame(scrollable_frame, bg="#121214")
+        approaches_frame.pack(fill=tk.X, padx=20, pady=10)
+
         directions = ["Northbound", "Eastbound", "Westbound", "Southbound"]
         self.path_labels = {}
-        
+
         for idx, direction in enumerate(directions):
             row_frame = tk.Frame(approaches_frame, bg="#1A1A1E", bd=1, relief="solid", highlightbackground="#2C2C2E", highlightcolor="#2C2C2E")
             row_frame.pack(fill=tk.X, pady=6, ipady=4)
-            
+
             color_accent = "#FF453A" if idx == 0 else ("#FFD60A" if idx == 1 else ("#30D158" if idx == 2 else "#0A84FF"))
             accent_bar = tk.Frame(row_frame, width=4, bg=color_accent)
             accent_bar.pack(side=tk.LEFT, fill=tk.Y)
-            
+
             info_frame = tk.Frame(row_frame, bg="#1A1A1E")
             info_frame.pack(side=tk.LEFT, padx=10, fill=tk.BOTH, expand=True)
-            
+
             lbl_dir = tk.Label(info_frame, text=f"{direction} Approach", font=header_font, fg="#E2E2E6", bg="#1A1A1E")
             lbl_dir.pack(anchor=tk.W)
-            
+
             initial_path = self.current_paths[direction].get()
             initial_filename = os.path.basename(initial_path) if initial_path else "Not Configured"
-            
+
             lbl_filename = tk.Label(info_frame, text=initial_filename, font=regular_font, fg="#8E8E93", bg="#1A1A1E", wraplength=350, justify=tk.LEFT)
             lbl_filename.pack(anchor=tk.W, pady=(2, 0))
             self.path_labels[direction] = lbl_filename
-            
+
             btn_browse = tk.Button(
                 row_frame, text="Browse", font=regular_font, bg="#2C2C2E", fg="#E2E2E6",
                 activebackground="#0A84FF", activeforeground="white", bd=0, relief="flat",
                 padx=8, pady=4, cursor="hand2", command=lambda d=direction: self._browse_path(d)
             )
             btn_browse.pack(side=tk.RIGHT, padx=15)
-            
-        global_helpers_frame = tk.Frame(self.dialog, bg="#121214")
+
+        global_helpers_frame = tk.Frame(scrollable_frame, bg="#121214")
         global_helpers_frame.pack(fill=tk.X, padx=20, pady=10)
-        
+
         btn_apply_all = tk.Button(
             global_helpers_frame, text="Apply Single Video to All Approaches", font=regular_font,
             bg="#1A1A1E", fg="#0A84FF", activebackground="#0A84FF", activeforeground="white",
@@ -98,7 +172,7 @@ class SetupDialog:
             padx=10, pady=4, command=self._apply_single_video
         )
         btn_apply_all.pack(side=tk.LEFT)
-        
+
         btn_reset = tk.Button(
             global_helpers_frame, text="Reset to Defaults", font=regular_font,
             bg="#1A1A1E", fg="#8E8E93", activebackground="#2C2C2E", activeforeground="white",
@@ -107,7 +181,7 @@ class SetupDialog:
         btn_reset.pack(side=tk.RIGHT)
 
         # System Configuration Frame
-        settings_frame = tk.LabelFrame(self.dialog, text="System Configuration", font=header_font, bg="#121214", fg="#0A84FF", bd=1, relief="solid", padx=10, pady=8)
+        settings_frame = tk.LabelFrame(scrollable_frame, text="System Configuration", font=header_font, bg="#121214", fg="#0A84FF", bd=1, relief="solid", padx=10, pady=8)
         settings_frame.pack(fill=tk.X, padx=20, pady=5)
         settings_frame.grid_columnconfigure(0, weight=1)
         settings_frame.grid_columnconfigure(1, weight=1)
@@ -145,32 +219,12 @@ class SetupDialog:
 
         self.lbl_rl_filename = tk.Label(rl_row, text=os.path.basename(self.rl_model_path_var.get()), font=regular_font, fg="#8E8E93", bg="#121214", wraplength=120, justify=tk.LEFT)
         self.lbl_rl_filename.pack(side=tk.LEFT, padx=8)
-        
-        sep2 = tk.Frame(self.dialog, height=1, bg="#2C2C2E")
-        sep2.pack(fill=tk.X, padx=20, pady=10)
-        
-        bottom_frame = tk.Frame(self.dialog, bg="#121214")
-        bottom_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(0, 20), padx=20)
-        
-        btn_exit = tk.Button(
-            bottom_frame, text="Exit Setup", font=btn_font,
-            bg="#2C2C2E", fg="#FF453A", activebackground="#FF453A", activeforeground="white",
-            bd=0, relief="flat", width=15, pady=8, cursor="hand2", command=self._on_cancel
-        )
-        btn_exit.pack(side=tk.LEFT)
-        
-        btn_start = tk.Button(
-            bottom_frame, text="Start Simulation", font=btn_font,
-            bg="#30D158", fg="black", activebackground="#248A3D", activeforeground="white",
-            bd=0, relief="flat", width=25, pady=8, cursor="hand2", command=self._on_start
-        )
-        btn_start.pack(side=tk.RIGHT)
-        
+
         self.dialog.protocol("WM_DELETE_WINDOW", self._on_cancel)
         self.parent.wait_window(self.dialog)
 
     def _browse_path(self, direction):
-        initial_dir = os.path.dirname(self.current_paths[direction].get()) if os.path.exists(self.current_paths[direction].get()) else os.path.dirname(__file__)
+        initial_dir = _default_browse_dir(self.current_paths[direction].get())
         selected_file = filedialog.askopenfilename(
             parent=self.dialog,
             initialdir=initial_dir,
@@ -183,7 +237,7 @@ class SetupDialog:
             self.path_labels[direction].config(text=filename, fg="#30D158")
             
     def _browse_rl_model(self):
-        initial_dir = os.path.dirname(self.rl_model_path_var.get()) if os.path.exists(self.rl_model_path_var.get()) else os.path.dirname(__file__)
+        initial_dir = _default_browse_dir(self.rl_model_path_var.get())
         selected_file = filedialog.askopenfilename(
             parent=self.dialog,
             initialdir=initial_dir,
@@ -223,19 +277,38 @@ class SetupDialog:
             
     def _on_start(self):
         new_video_paths = []
+        missing = []
         for d in self.current_paths:
-            new_video_paths.append((d, self.current_paths[d].get()))
+            p = self.current_paths[d].get().strip()
+            new_video_paths.append((d, p))
+            if not p or not os.path.exists(p):
+                missing.append(d)
+        if missing:
+            messagebox.showwarning(
+                "Video Missing",
+                "These approaches have no valid video file:\n- " + "\n- ".join(missing)
+                + "\n\nYou can still proceed, but those approaches will be skipped.",
+            )
+        if self.rl_enabled_var.get():
+            rp = self.rl_model_path_var.get().strip()
+            if not rp or not os.path.exists(rp):
+                if not messagebox.askokcancel(
+                    "RL Weights Missing",
+                    f"RL weights not found:\n{rp}\n\nProceed with RL disabled for this run?",
+                ):
+                    return
+                self.rl_enabled_var.set(False)
         config.VIDEO_PATHS = new_video_paths
-        
+
         # Commit system settings to config
         config.ESP32_ENABLED = self.esp32_enabled_var.get()
-        config.ESP32_PORT = self.esp32_port_var.get()
+        config.ESP32_PORT = self.esp32_port_var.get().strip() or "COM3"
         config.RL_MODEL_ENABLED = self.rl_enabled_var.get()
         config.RL_MODEL_PATH = self.rl_model_path_var.get()
-        
-        print(f"[GUI Setup] Video paths updated to: {config.VIDEO_PATHS}")
-        print(f"[GUI Setup] ESP32: {config.ESP32_ENABLED} on Port {config.ESP32_PORT}")
-        print(f"[GUI Setup] RL Enabled: {config.RL_MODEL_ENABLED} using weights {config.RL_MODEL_PATH}")
+
+        logger.info("Video paths: %s | ESP32=%s:%s | RL=%s",
+                    config.VIDEO_PATHS, config.ESP32_ENABLED,
+                    config.ESP32_PORT, config.RL_MODEL_ENABLED)
         self.success = True
         self.dialog.destroy()
         

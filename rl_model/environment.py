@@ -15,8 +15,8 @@ def get_time_varying_arrival_rate(time_fraction, base_rate=0.1, peak_multiplier=
 class TrafficEnv:
     """
     Improved training environment with configurable vehicle types, per-lane arrival rates (Poisson),
-    and per-type vehicle weights. State layout matches runtime: flattened per-lane per-type counts
-    followed by a one-hot current-lane vector.
+    and per-type vehicle weights. State layout matches runtime:
+    flattened per-lane per-type counts, wait times, ambulance flags, one-hot current lane.
     """
     def __init__(self,
                  num_lanes=4,
@@ -63,30 +63,64 @@ class TrafficEnv:
         # recomputed on every single Poisson arrival step during simulation.
         weights_inv = 1.0 / (self.vehicle_weights + 1e-6)
         self._arrival_probs = weights_inv / np.sum(weights_inv)
+        self._rng = np.random.RandomState()
+
+    def seed(self, seed):
+        """Seed this env's isolated RNG (plus globals for legacy callers)."""
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        self._rng.seed(seed)
+        return [seed]
+
+    @property
+    def state_dim(self):
+        from rl_model.contract import state_dim as _sd
+        return _sd(self.num_lanes, self.num_vehicle_types)
+
+    @property
+    def action_dim(self):
+        from rl_model.contract import action_dim as _ad
+        return _ad(self.num_lanes, self.num_duration_options)
 
     def get_one_hot_lane(self):
         one_hot = np.zeros(self.num_lanes, dtype=float)
         one_hot[self.current_lane] = 1.0
         return one_hot
 
-    def normalize_state(self, state, normalize_max):
-        # state is [vehicle_counts (24), wait_times (4), ambulance_flags (4), one_hot_lane (4)]
-        v_end = self.num_lanes * (self.num_vehicle_types if self.num_vehicle_types > 0 else 1)
-        w_end = v_end + self.num_lanes
-        normalized = state.copy()
+    def get_starved_lane(self, threshold_s):
+        """Index of longest-waiting lane above threshold, else None."""
+        if self.wait_times is None or len(self.wait_times) != self.num_lanes:
+            return None
+        idx = int(np.argmax(self.wait_times))
+        return idx if float(self.wait_times[idx]) > float(threshold_s) else None
+
+    @staticmethod
+    def normalize_state_vector(state, num_lanes, num_vehicle_types, normalize_max=50.0):
+        """
+        Canonical normalization function for RL state vectors across the system.
+        Transforms:
+        - Vehicle counts: scaled linearly by normalize_max
+        - Wait times: mapped using log1p(t) / log1p(300) to smoothly bound extreme starvation
+        - Ambulance flags & one-hot lane: unchanged (binary 0/1)
+        """
+        v_end = num_lanes * (num_vehicle_types if num_vehicle_types > 0 else 1)
+        w_end = v_end + num_lanes
+        normalized = np.array(state, dtype=float).copy()
         normalized[:v_end] = normalized[:v_end] / max(1.0, float(normalize_max))
-        # Use log1p scale for wait times so the agent can distinguish starvation
-        # levels beyond 300 s. log(1+t)/log(301) maps [0, 300] -> [0, 1] and
-        # continues to grow (slowly) for t > 300, avoiding the information loss
-        # that a hard clamp introduces.
-        _log_scale = np.log1p(300.0)  # ≈ 5.707
-        normalized[v_end:w_end] = np.log1p(normalized[v_end:w_end]) / _log_scale
-        # ambulance flags and one-hot lane remain as 0/1
+        if len(normalized) >= w_end:
+            _log_scale = np.log1p(300.0)  # ≈ 5.707
+            normalized[v_end:w_end] = np.log1p(np.maximum(0.0, normalized[v_end:w_end])) / _log_scale
         return normalized
 
+    def normalize_state(self, state, normalize_max):
+        return TrafficEnv.normalize_state_vector(
+            state, self.num_lanes, self.num_vehicle_types, normalize_max
+        )
+
     def reset(self):
-        # random initial queues
-        self.state_vehicle_counts = np.random.randint(0, 10, size=(self.num_lanes, self.num_vehicle_types))
+        # random initial queues (isolated RNG for reproducibility)
+        self.state_vehicle_counts = self._rng.randint(0, 10, size=(self.num_lanes, self.num_vehicle_types))
         self.ambulance_presence = np.zeros(self.num_lanes, dtype=float)
         self.wait_times = np.zeros(self.num_lanes, dtype=float)
         self.current_lane = 0
@@ -104,6 +138,8 @@ class TrafficEnv:
         ])
 
     def step(self, action):
+        from rl_model.contract import validate_action as _va
+        _va(action, self.num_lanes, self.num_duration_options)
         self.current_step += 1
         if self.use_time_varying_arrival_rate:
             time_fraction = min(self.current_time / max(1.0, self.max_time), 1.0)
@@ -162,15 +198,15 @@ class TrafficEnv:
         # Arrivals: Poisson arrivals per lane per vehicle type proportional to arrival_rate and duration
         for ln in range(self.num_lanes):
             lam = max(0.0, float(self.arrival_rate_per_lane[ln]) * max(1.0, duration))
-            arrivals_total = np.random.poisson(lam)
+            arrivals_total = self._rng.poisson(lam)
             if arrivals_total > 0:
-                arrivals_by_type = np.random.multinomial(arrivals_total, self._arrival_probs)
+                arrivals_by_type = self._rng.multinomial(arrivals_total, self._arrival_probs)
             else:
                 arrivals_by_type = np.zeros(self.num_vehicle_types, dtype=int)
             self.state_vehicle_counts[ln] += arrivals_by_type
 
             # Simulate ambulance arrivals
-            if np.random.random() < 0.02: # 2% chance per lane per decision step
+            if self._rng.random() < 0.02: # 2% chance per lane per decision step
                 self.ambulance_presence[ln] = 1.0
 
         # Clamp queues

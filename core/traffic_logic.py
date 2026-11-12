@@ -1,10 +1,10 @@
-import time
 from collections import defaultdict
-import math
-import traceback
 import numpy as np
 
 from core.intersection_state import IntersectionState
+from core.log import get_logger
+
+logger = get_logger(__name__)
 
 class TrafficLightController:
     def __init__(self, config_data, vehicle_type_weights=None, default_vehicle_weight=1.0):
@@ -18,24 +18,25 @@ class TrafficLightController:
         self.vehicle_type_order = getattr(config, 'TARGET_CLASSES', list(self.vehicle_type_weights.keys()))
 
         if not config_data:
-            print("[TrafficLogic Error] No configuration data provided.")
+            logger.error("No configuration data provided.")
             raise ValueError("Traffic light configuration cannot be empty.")
 
-        print("[TrafficLogic] Initializing intersections...")
+        logger.debug("Initializing intersections...")
         for name, int_config in config_data.items():
             try:
                 self._initialize_intersection_state(name, int_config)
             except ValueError as e:
-                 print(f"[TrafficLogic Error] Failed to initialize intersection '{name}': {e}")
+                 logger.error("Failed to initialize intersection '%s': %s", name, e)
                  raise
 
         if not self.intersections:
-             print("[TrafficLogic Error] No intersections were successfully initialized. Check config.")
+             logger.error("No intersections were successfully initialized.")
              raise ValueError("No valid intersections configured.")
 
-        print(f"[TrafficLogic] Controller initialized for intersections: {list(self.intersections.keys())}")
-        print(f"[TrafficLogic] Managing approaches: {sorted(list(self.all_approach_names))}")
-        print(f"[TrafficLogic] Using vehicle weights: {self.vehicle_type_weights} (Default: {self.default_vehicle_weight})")
+        logger.debug(
+            "Controller initialized for %s; approaches=%s",
+            list(self.intersections.keys()), sorted(list(self.all_approach_names)),
+        )
 
 
     def _validate_phase_config(self, name, phases_config):
@@ -74,7 +75,7 @@ class TrafficLightController:
 
         demand_threshold = config.get('demand_threshold', 1)
         if not isinstance(demand_threshold, (int, float)) or demand_threshold < 0:
-             print(f"[TrafficLogic Warning] Invalid 'demand_threshold' for '{name}'. Using default 1.")
+             logger.warning("Invalid demand_threshold for '%s'. Using default 1.", name)
              demand_threshold = 1
 
         self.intersections[name] = IntersectionState(
@@ -86,7 +87,7 @@ class TrafficLightController:
             demand_threshold=demand_threshold,
             vehicle_type_order=self.vehicle_type_order
         )
-        print(f"[TrafficLogic]   - Initialized '{name}': Starting ALL_RED, first phase '{phase_names_list[0]}'. Managed approaches: {sorted(list(intersection_approaches))}")
+        logger.debug("Initialized '%s': ALL_RED, first phase '%s'.", name, phase_names_list[0])
 
     
     def set_manual_override(self, intersection_name, approach_name, is_forced_red):
@@ -95,12 +96,12 @@ class TrafficLightController:
             if approach_name in state["managed_approaches"]:
                 state["manual_override_red"][approach_name] = is_forced_red
                 action = "FORCED RED" if is_forced_red else "RELEASED from manual red"
-                print(f"[{state['name']}] Manual override for approach '{approach_name}' set to: {action}")
+                logger.info("[%s] Manual override %s: %s", state['name'], approach_name, action)
 
                 
                 
                 return True
-        print(f"[TrafficLogic Warning] Could not set manual override for '{approach_name}' in '{intersection_name}' (Intersection or approach not found).")
+        logger.warning("Could not set manual override for '%s' in '%s'.", approach_name, intersection_name)
         return False
     
 
@@ -126,8 +127,9 @@ class TrafficLightController:
 
     def update_weighted_demand(self, approach_name, counts_by_type, current_time):
         current_weighted_value_this_update = 0
+        lower_weight_map = {k.lower(): v for k, v in self.vehicle_type_weights.items()}
         for vehicle_type, count in counts_by_type.items():
-            weight = self.vehicle_type_weights.get(vehicle_type, self.default_vehicle_weight)
+            weight = lower_weight_map.get(str(vehicle_type).lower(), self.default_vehicle_weight)
             current_weighted_value_this_update += count * weight
         
         for int_state in self.intersections.values():
@@ -166,10 +168,7 @@ class TrafficLightController:
                 if state.update_single_intersection_state(current_time, rl_action=rl_action):
                     any_state_changed = True
             except Exception as e:
-                print(f"[TrafficLogic Error] Unhandled exception in update_single_intersection_state for '{name}': {e}")
-                traceback.print_exc()
-
-
+                logger.exception("Unhandled exception in update_single_intersection_state for '%s': %s", name, e)
 
     def get_rl_state(self, intersection_name):
         state_data = self.intersections.get(intersection_name)
@@ -182,12 +181,21 @@ class TrafficLightController:
         # Build vehicle counts per lane in the configured vehicle type order
         vt_order = self.vehicle_type_order if self.vehicle_type_order else []
         counts_list = []
+        current_phase_key = state_data['phases'][state_data['current_phase_index']]
+        current_state = state_data['current_state']
+
         for phase_key in phase_order:
             approach_name = state_data['config']['phases'][phase_key][0]
-            stored_counts = state_data['approach_counts_by_type'].get(approach_name, {})
+            # If approach is in GREEN or YELLOW phase, queued demand is zero (vehicles passing through)
+            is_active_green_or_yellow = (phase_key == current_phase_key) and (current_state in ["GREEN", "YELLOW"])
+            if is_active_green_or_yellow:
+                stored_counts = {}
+            else:
+                stored_counts = state_data['approach_counts_by_type'].get(approach_name, {})
+
             # If no vehicle types configured, fall back to weighted demand as single scalar
             if not vt_order:
-                demand = state_data['approach_weighted_demand'].get(approach_name, 0.0)
+                demand = 0.0 if is_active_green_or_yellow else state_data['approach_weighted_demand'].get(approach_name, 0.0)
                 counts_list.append([demand])
             else:
                 per_type = [float(stored_counts.get(vt, 0)) for vt in vt_order]

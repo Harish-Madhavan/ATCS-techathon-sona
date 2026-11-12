@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atcs"
+version = "3.6.0"
+description = "Adaptive Traffic Control System (ATCS) combining YOLOv11, Dueling Double Deep Q-Networks (D3QN), and ESP32 Microcontroller Hardware-in-the-Loop."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "ATCS Team"}
+]
+keywords = [
+    "traffic-control",
+    "reinforcement-learning",
+    "dueling-dqn",
+    "computer-vision",
+    "yolo",
+    "esp32",
+    "smart-city"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "torch>=2.0.0",
+]
+
+[project.optional-dependencies]
+vision = [
+    "opencv-python>=4.8.0",
+    "ultralytics>=8.0.0",
+]
+gui = [
+    "matplotlib>=3.7.0",
+]
+hardware = [
+    "pyserial>=3.5",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+all = [
+    "numpy>=1.24.0",
+    "torch>=2.0.0",
+    "opencv-python>=4.8.0",
+    "ultralytics>=8.0.0",
+    "matplotlib>=3.7.0",
+    "pyserial>=3.5",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+atcs = "main:main"
+atcs-train = "rl_model.train:main"
+atcs-benchmark = "benchmark:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "gui*", "hardware*", "rl_model*", "vision*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = "-v"
+
+[tool.coverage.run]
+source = ["core", "rl_model", "hardware", "gui", "vision"]
+omit = [
+    "tests/*",
+    "tools/*",
+]

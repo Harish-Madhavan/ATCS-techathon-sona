@@ -1,10 +1,19 @@
 import multiprocessing as mp
 import os
-import time
-import traceback
-import torch
-from vision.video_processor import process_video_worker
+import numpy as np
 from core import config
+from core.log import get_logger
+from rl_model.device import get_best_device_str
+from vision.video_processor import process_video_worker
+
+logger = get_logger(__name__)
+
+def is_valid_polygon(polygon):
+    try:
+        arr = np.asarray(polygon)
+        return arr.ndim == 2 and arr.shape[0] >= 3 and arr.shape[1] == 2
+    except Exception:
+        return False
 
 class WorkerManager:
     def __init__(self, results_queue):
@@ -28,13 +37,20 @@ class WorkerManager:
         self.finished_workers = 0
         self.final_summaries.clear()
 
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"[WorkerManager] Starting parallel processing for {len(defined_polygons)} approaches using device hint '{device}'...")
+        device = get_best_device_str()
+        logger.info("Starting %d workers (device=%s)...", len(defined_polygons), device)
 
         for approach_name, polygon in defined_polygons.items():
             video_path = next((path for name, path in config.VIDEO_PATHS if name == approach_name), None)
-            if not video_path:
-                print(f"[WorkerManager Error] Missing video path for {approach_name}. Skipping.")
+            if not video_path or not os.path.exists(video_path):
+                err = RuntimeError(f"Video not found: {video_path}")
+                logger.warning("Skipping %s: %s", approach_name, err)
+                on_worker_failed_cb(approach_name, err)
+                continue
+            if not is_valid_polygon(polygon):
+                err = ValueError(f"Invalid ROI polygon for {approach_name} (need Nx2, >=3 pts)")
+                logger.warning("%s", err)
+                on_worker_failed_cb(approach_name, err)
                 continue
             
             p = mp.Process(
@@ -53,8 +69,7 @@ class WorkerManager:
                 self.active_workers_initial_count += 1
                 on_worker_started_cb(approach_name, p.pid)
             except Exception as e:
-                print(f"[WorkerManager Error] Failed to start process for {approach_name}: {e}")
-                traceback.print_exc()
+                logger.exception("Failed to start %s: %s", approach_name, e)
                 on_worker_failed_cb(approach_name, e)
 
         return self.active_workers_initial_count
@@ -71,7 +86,7 @@ class WorkerManager:
                 if pid not in active_pids:
                     dead_approach_name = self.process_map[pid]
                     if dead_approach_name not in self.final_summaries:
-                        print(f"\n!!! [WorkerManager Error] Worker PID {pid} for {dead_approach_name} terminated unexpectedly. !!!")
+                        logger.warning("Worker PID %s for %s terminated unexpectedly.", pid, dead_approach_name)
                         self.final_summaries[dead_approach_name] = {
                             'type': 'error',
                             'error': 'Process terminated unexpectedly',
@@ -87,10 +102,13 @@ class WorkerManager:
         """
         active_processes = [p for p in self.processes if p.is_alive()]
         if active_processes:
-            print(f"[WorkerManager] Terminating {len(active_processes)} active worker process(es)...")
+            logger.info("Terminating %d worker(s)...", len(active_processes))
             for p in active_processes:
                 try:
                     p.terminate()
-                    p.join(timeout=1.0)
+                    p.join(timeout=2.0)
+                    if p.is_alive():
+                        p.kill()
+                        p.join(timeout=1.0)
                 except Exception as e:
-                    print(f"[WorkerManager] Error terminating PID {p.pid if p else '?'}: {e}")
+                    logger.warning("Error terminating PID %s: %s", getattr(p, "pid", "?"), e)
